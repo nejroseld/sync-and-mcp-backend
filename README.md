@@ -7,6 +7,17 @@ plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и с
 Зависимости: Python 3.11+, `fastapi`, `uvicorn`, `httpx`. Всё остальное стандартная библиотека
 (sqlite3 с FTS5). `numpy` необязателен: если установлен, косинус считается быстрее.
 
+## Самый быстрый запуск: `./local.sh`
+
+```bash
+cd server && ./local.sh
+```
+
+При первом запуске создаёт `.venv`, ставит зависимости, заводит vault `Personal`, admin-, device- и
+MCP-токены и пишет их в `data/TOKENS.txt` (вместе с командой для Claude Code и командами отладки).
+Затем запускает сервер на `http://127.0.0.1:8766`. Повторные запуски просто стартуют сервер.
+Переопределить: `OBSI_PORT=9000 OBSI_HOST=0.0.0.0 OBSI_DATA_DIR=~/obsi-data ./local.sh`.
+
 ## Запуск на своей машине (пошагово)
 
 Сценарий: сервер и Obsidian на одном компьютере. Нужен Python 3.11+ (`python3 --version`).
