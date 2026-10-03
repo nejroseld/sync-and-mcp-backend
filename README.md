@@ -7,13 +7,78 @@ plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и с
 Зависимости: Python 3.11+, `fastapi`, `uvicorn`, `httpx`. Всё остальное стандартная библиотека
 (sqlite3 с FTS5). `numpy` необязателен: если установлен, косинус считается быстрее.
 
-## Запуск
+## Запуск на своей машине (пошагово)
+
+Сценарий: сервер и Obsidian на одном компьютере. Нужен Python 3.11+ (`python3 --version`).
+
+**1. Забрать код** (из git-репозитория или скопировать папку `server/`, например с ВМ):
+
+```bash
+scp -r ai@192.168.122.187:/workspace/obsi-mcp/server ~/obsi-server
+cd ~/obsi-server
+```
+
+Если скопировать вместе с `server/data/`, сохранятся уже созданные vault'ы и токены
+(см. `data/TOKENS.txt`); тогда шаг 4 можно пропустить.
+
+**2. Установить зависимости в venv:**
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .            # fastapi, uvicorn, httpx; numpy по желанию: pip install -e '.[fast]'
+```
+
+**3. Запустить сервер** (терминал оставить открытым, остановка — Ctrl+C):
+
+```bash
+obsi-server --data-dir ./data serve --port 8766
+# проверка из другого терминала:
+curl http://127.0.0.1:8766/api/v1/health
+```
+
+По умолчанию сервер слушает только `127.0.0.1` — для Obsidian на той же машине этого достаточно.
+Для телефона в локальной сети: `--host 0.0.0.0` и открыть порт в firewall
+(`sudo firewall-cmd --add-port=8766/tcp`).
+
+**4. Создать vault и токены** (в другом терминале, с тем же `--data-dir`; сервер можно не
+останавливать):
+
+```bash
+. .venv/bin/activate
+obsi-server --data-dir ./data admin create-token --kind admin --name root
+obsi-server --data-dir ./data admin create-vault --name Personal          # -> v_XXX
+obsi-server --data-dir ./data admin create-token --kind device --name laptop --vault v_XXX --ops read,write
+obsi-server --data-dir ./data admin create-token --kind mcp --name claude --vault v_XXX --ops list,search,read,write
+```
+
+Токены показываются один раз — сохраните их.
+
+**5. Плагин в Obsidian:** скопировать `main.js`, `manifest.json`, `styles.css` из `plugin/`
+(собрать: `cd plugin && npm install && npm run build`) в `<vault>/.obsidian/plugins/obsi-sync/`,
+включить в Settings → Community plugins. В настройках плагина: Server URL `http://127.0.0.1:8766`,
+device-токен, mount с пустым путём → vault `Personal`, свой пароль шифрования.
+
+**6. MCP в Claude Code:**
+
+```bash
+claude mcp add --transport http obsi http://127.0.0.1:8766/mcp --header "Authorization: Bearer <mcp-токен>"
+```
+
+**Отладка:** `curl -v http://127.0.0.1:8766/api/v1/health` — сервер жив;
+`curl -H "Authorization: Bearer <device-токен>" http://127.0.0.1:8766/api/v1/me` — токен валиден.
+`connection refused` — сервер не запущен или другой порт; `401` — неверный/отозванный токен.
+
+## Запуск (кратко)
 
 ```bash
 cd server
-python3 -m obsi_server serve --host 0.0.0.0 --port 8765
-# или: pip install -e . && obsi-server serve
+python3 -m obsi_server --data-dir ./data serve --host 0.0.0.0 --port 8765
+# или: pip install -e . && obsi-server --data-dir ./data serve
 ```
+
+Все команды (`serve` и `admin ...`) должны использовать один и тот же каталог данных
+(`--data-dir` или `OBSI_DATA_DIR`; по умолчанию `./obsi-data` относительно текущей папки).
 
 Конфигурация через переменные окружения (или TOML-файл, путь в `OBSI_CONFIG`, секция `[server]`):
 
@@ -34,10 +99,10 @@ python3 -m obsi_server serve --host 0.0.0.0 --port 8765
 
 ```bash
 cd server
-python3 -m obsi_server admin create-token --kind admin --name root          # админ-токен (показывается один раз)
-python3 -m obsi_server admin create-vault --name Personal                   # -> id вида v_xxxxxxxxxxxxxxxx
-python3 -m obsi_server admin create-token --kind device --name laptop --vault v_XXX --ops read,write
-python3 -m obsi_server admin create-token --kind mcp --name claude --vault v_XXX --ops list,search,read,write
+python3 -m obsi_server --data-dir ./data admin create-token --kind admin --name root          # админ-токен (показывается один раз)
+python3 -m obsi_server --data-dir ./data admin create-vault --name Personal                   # -> id вида v_xxxxxxxxxxxxxxxx
+python3 -m obsi_server --data-dir ./data admin create-token --kind device --name laptop --vault v_XXX --ops read,write
+python3 -m obsi_server --data-dir ./data admin create-token --kind mcp --name claude --vault v_XXX --ops list,search,read,write
 ```
 
 Device-токен и id vault'а вводятся в плагине. Дальше всё то же доступно через admin REST API
