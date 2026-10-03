@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "obsi-server"
+version = "0.1.0"
+description = "obsi-mcp server: E2EE sync storage, AI Available store, MCP endpoint and RAG"
+requires-python = ">=3.11"
+dependencies = ["fastapi", "uvicorn", "httpx"]
+
+[project.optional-dependencies]
+fast = ["numpy"]
+
+[project.scripts]
+obsi-server = "obsi_server.cli:main"
+
+[tool.setuptools]
+packages = ["obsi_server"]
