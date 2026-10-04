@@ -2,7 +2,7 @@
 
 Сервер для плагина Obsidian: хранит зашифрованные blob'ы vault'ов (sync), принимает опубликованный
 plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и строит поиск (FTS5 + эмбеддинги).
-Контракт описан в `../docs/API.md`, архитектура в `../docs/ARCHITECTURE.md`.
+Контракт описан в `docs/API.md`, архитектура в `docs/ARCHITECTURE.md`.
 
 Зависимости: Python 3.11+, `fastapi`, `uvicorn`, `httpx`. Всё остальное стандартная библиотека
 (sqlite3 с FTS5). `numpy` необязателен: если установлен, косинус считается быстрее.
@@ -10,7 +10,7 @@ plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и с
 ## Самый быстрый запуск: `./local.sh`
 
 ```bash
-cd server && ./local.sh
+./local.sh
 ```
 
 При первом запуске создаёт `.venv`, ставит зависимости, заводит vault `Personal`, admin-, device- и
@@ -22,14 +22,14 @@ MCP-токены и пишет их в `data/TOKENS.txt` (вместе с ком
 
 Сценарий: сервер и Obsidian на одном компьютере. Нужен Python 3.11+ (`python3 --version`).
 
-**1. Забрать код** (из git-репозитория или скопировать папку `server/`, например с ВМ):
+**1. Забрать код** (из Git-репозитория сервера или скопировать его каталог, например с ВМ):
 
 ```bash
-scp -r ai@192.168.122.187:/workspace/obsi-mcp/server ~/obsi-server
+scp -r ai@192.168.122.187:/path/to/obsi-server ~/obsi-server
 cd ~/obsi-server
 ```
 
-Если скопировать вместе с `server/data/`, сохранятся уже созданные vault'ы и токены
+Если скопировать вместе с `data/`, сохранятся уже созданные vault'ы и токены
 (см. `data/TOKENS.txt`); тогда шаг 4 можно пропустить.
 
 **2. Установить зависимости в venv:**
@@ -65,8 +65,8 @@ obsi-server --data-dir ./data admin create-token --kind mcp --name claude --vaul
 
 Токены показываются один раз — сохраните их.
 
-**5. Плагин в Obsidian:** скопировать `main.js`, `manifest.json`, `styles.css` из `plugin/`
-(собрать: `cd plugin && npm install && npm run build`) в `<vault>/.obsidian/plugins/obsi-sync/`,
+**5. Плагин в Obsidian:** в отдельном репозитории плагина выполните `npm install && npm run build`,
+затем скопируйте `main.js`, `manifest.json`, `styles.css` в `<vault>/.obsidian/plugins/obsi-sync/`,
 включить в Settings → Community plugins. В настройках плагина: Server URL `http://127.0.0.1:8766`,
 device-токен, mount с пустым путём → vault `Personal`, свой пароль шифрования.
 
@@ -83,7 +83,6 @@ claude mcp add --transport http obsi http://127.0.0.1:8766/mcp --header "Authori
 ## Запуск (кратко)
 
 ```bash
-cd server
 python3 -m obsi_server --data-dir ./data serve --host 0.0.0.0 --port 8765
 # или: pip install -e . && obsi-server --data-dir ./data serve
 ```
@@ -109,7 +108,6 @@ python3 -m obsi_server --data-dir ./data serve --host 0.0.0.0 --port 8765
 ## Быстрый старт
 
 ```bash
-cd server
 python3 -m obsi_server --data-dir ./data admin create-token --kind admin --name root          # админ-токен (показывается один раз)
 python3 -m obsi_server --data-dir ./data admin create-vault --name Personal                   # -> id вида v_xxxxxxxxxxxxxxxx
 python3 -m obsi_server --data-dir ./data admin create-token --kind device --name laptop --vault v_XXX --ops read,write
@@ -150,7 +148,7 @@ Authorization.
 ## Тесты
 
 ```bash
-cd server && python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 ```
 
 ## Smoke-тест (выполнялся вручную)

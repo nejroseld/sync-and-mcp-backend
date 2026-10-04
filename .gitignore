@@ -1,0 +1,6 @@
+.venv/
+data/
+obsi-data/
+__pycache__/
+*.egg-info/
+*.py[cod]
