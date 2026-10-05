@@ -16,6 +16,9 @@ ALLOWED_OPS = {
     "admin": set(),
 }
 LAST_USED_THROTTLE_MS = 5_000
+PASSWORD_SCRYPT_N = 2**14
+PASSWORD_SCRYPT_R = 8
+PASSWORD_SCRYPT_P = 5
 
 
 @dataclass
@@ -66,8 +69,9 @@ class AuthService:
     @staticmethod
     def _password_hash(password: str) -> str:
         salt = secrets.token_bytes(16)
-        digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
-        return "scrypt$16384$8$1$" + salt.hex() + "$" + digest.hex()
+        digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=PASSWORD_SCRYPT_N,
+                                r=PASSWORD_SCRYPT_R, p=PASSWORD_SCRYPT_P)
+        return f"scrypt${PASSWORD_SCRYPT_N}${PASSWORD_SCRYPT_R}${PASSWORD_SCRYPT_P}$" + salt.hex() + "$" + digest.hex()
 
     @staticmethod
     def _verify_password(password: str, encoded: str) -> bool:
@@ -137,6 +141,11 @@ class AuthService:
         row = self.db.one("SELECT * FROM users WHERE username=?", (norm,))
         if not row or not self._verify_password(password, row["password_hash"]):
             raise ApiError(401, "invalid_credentials", "username or password is incorrect")
+        encoded = row["password_hash"]
+        if encoded.split("$")[:4] != ["scrypt", str(PASSWORD_SCRYPT_N),
+                                       str(PASSWORD_SCRYPT_R), str(PASSWORD_SCRYPT_P)]:
+            self.db.execute("UPDATE users SET password_hash=? WHERE id=? AND password_hash=?",
+                            (self._password_hash(password), row["id"], encoded))
         user = self.public_user(row)
         plain = "obsi_" + secrets.token_urlsafe(32)
         tid, ts = "tok_" + secrets.token_hex(6), now_ms()

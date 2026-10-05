@@ -1,7 +1,9 @@
 """SQLite wrapper: one shared connection (WAL), a lock, and versioned migrations."""
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -67,11 +69,23 @@ MIGRATIONS: list[str] = [
     ALTER TABLE tokens ADD COLUMN is_session INTEGER NOT NULL DEFAULT 0;
     UPDATE tokens SET is_session=1 WHERE user_id IS NOT NULL AND name LIKE 'user:%';
     """,
+    """
+    CREATE TABLE rate_limits(key TEXT PRIMARY KEY, tat_ms INTEGER NOT NULL);
+    CREATE INDEX rate_limits_expiry ON rate_limits(tat_ms);
+    """,
 ]
 
 
 class Database:
     def __init__(self, path: Path | str):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # The database contains token hashes, password hashes, and configuration secrets.
+        if stat.S_IMODE(path.parent.stat().st_mode) & 0o077:
+            raise PermissionError(f"data directory {path.parent} must be owner-only (chmod 700)")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(fd)
+        path.chmod(0o600)
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()

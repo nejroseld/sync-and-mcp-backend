@@ -116,9 +116,12 @@ Streamable HTTP transport (MCP spec 2025-06-18; принимаем и `2025-03-2
 ## Заметки реализации сервера (уточнения к контракту)
 
 * `ETag` в ответах storage — hex sha256 без кавычек (как `etag` в листинге).
-* Admin-токен не имеет доступа к данным: sync/AI/changes endpoints требуют `kind=device` (403 иначе);
-  `/mcp` требует `kind=mcp` (403 иначе, 401 без токена).
-* Дополнительные коды: `413 payload_too_large` (лимит тела), `503 s3_unavailable` (для уже
+* Admin-токен не читает данные напрямую: sync/AI/changes endpoints требуют `kind=device` (403 иначе),
+  `/mcp` требует `kind=mcp` (403 иначе, 401 без токена). Admin-токен может выдать новый токен
+  с доступом к любому vault, поэтому его нужно хранить как полный доступ к серверу.
+* Дополнительные коды: `413 payload_too_large` (лимит тела), `413 batch_too_large`
+  (более 100 сообщений в одном MCP batch), `429 rate_limited` с заголовком `Retry-After`,
+  `503 s3_unavailable` (для уже
   выгруженного объекта отсутствует настройка S3 или драйвер), `404 feature_disabled`
   (модуль выключен), `405` на `GET /mcp`.
 * `stale_publish` (409) возвращает в `error` ещё `current_version` и `current_mtime`. PUT с тем же

@@ -17,12 +17,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import __version__
 from .ai_store import AiStore, norm_path
 from .auth import AuthService, Token
+from .body_limit import BodyLimitMiddleware
 from .changes import ChangeQueue
 from .config import Config
 from .db import Database
 from .errors import ApiError
 from .mcp import McpServer
 from .rag import EmbedFn, RagService, http_embed
+from .rate_limit import Limit, RateLimiter
 from .storage import Storage
 from .vaults import VaultService
 
@@ -32,6 +34,7 @@ class Context:
     config: Config
     db: Database
     auth: AuthService
+    limiter: RateLimiter
     vaults: VaultService
     storage: Storage
     ai: AiStore
@@ -41,7 +44,7 @@ class Context:
 
 
 def build_context(config: Config, embed_fn: EmbedFn = http_embed) -> Context:
-    config.data_dir.mkdir(parents=True, exist_ok=True)
+    config.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     db = Database(config.data_dir / "obsi.db")
     vaults, changes = VaultService(db), ChangeQueue(db)
     auth, storage = AuthService(db), Storage(db, config.data_dir, config)
@@ -50,7 +53,8 @@ def build_context(config: Config, embed_fn: EmbedFn = http_embed) -> Context:
     vaults.on_delete += [storage.purge, changes.purge, auth.drop_vault, ai.clear]
     if config.features["rag"]:
         rag.attach()
-    return Context(config, db, auth, vaults, storage, ai, changes, rag, McpServer(config, vaults, ai, changes, rag))
+    return Context(config, db, auth, RateLimiter(db), vaults, storage, ai, changes, rag,
+                   McpServer(config, vaults, ai, changes, rag))
 
 
 # ---- request helpers ---------------------------------------------------------------
@@ -63,14 +67,27 @@ def _bearer(request: Request) -> str | None:
     return h[7:].strip() if h.lower().startswith("bearer ") else None
 
 
+def _client_key(request: Request) -> str:
+    # Uvicorn accepts forwarded addresses only from the local Caddy proxy.
+    host = request.client.host if request.client else "unknown"
+    return RateLimiter.key("client", host)
+
+
+def _token_limit(ctx: Context, tok: Token) -> None:
+    ctx.limiter.check(Limit(RateLimiter.key("token", tok.id),
+                            ctx.config.sync_requests_per_minute, 60_000))
+
+
 def auth(*kinds: str):
     """Dependency: authenticated, non-revoked token of one of `kinds` (any if empty)."""
     def dep(request: Request) -> Token:
-        tok = get_ctx(request).auth.authenticate(_bearer(request))
+        ctx = get_ctx(request)
+        tok = ctx.auth.authenticate(_bearer(request))
         if not tok:
             raise ApiError(401, "unauthorized", "missing, invalid or revoked token")
         if kinds and tok.kind not in kinds:
             raise ApiError(403, "forbidden", f"token kind '{tok.kind}' cannot use this endpoint")
+        _token_limit(ctx, tok)
         request.state.token = tok
         return tok
     return dep
@@ -253,12 +270,21 @@ def user_auth_router() -> APIRouter:
 
     @r.post("/register")
     def register(body: RegisterIn, request: Request):
-        user, token = get_ctx(request).auth.register(body.invite_code, body.username, body.password)
+        ctx = get_ctx(request)
+        ctx.limiter.check(Limit("register:" + _client_key(request), 60, 600_000))
+        user, token = ctx.auth.register(body.invite_code, body.username, body.password)
         return {"token": token, "user": user}
 
     @r.post("/login")
     def login(body: LoginIn, request: Request):
-        user, token = get_ctx(request).auth.login(body.username, body.password)
+        ctx = get_ctx(request)
+        ip = _client_key(request)
+        account = RateLimiter.key("login-account", AuthService.normalize_username(body.username))
+        ctx.limiter.check(Limit("login-short:" + ip, 20, 10_000),
+                          Limit("login-long:" + ip, 120, 600_000),
+                          Limit("login-account-short:" + account, 10, 60_000),
+                          Limit("login-account-long:" + account, 30, 600_000))
+        user, token = ctx.auth.login(body.username, body.password)
         return {"token": token, "user": user}
     return r
 
@@ -297,6 +323,7 @@ def admin_router() -> APIRouter:
     def reindex(vid: str, request: Request):
         ctx = get_ctx(request)
         ctx.vaults.require(vid)
+        ctx.limiter.check(Limit(RateLimiter.key("reindex", vid), 10, 3_600_000))
         ctx.rag.reindex_vault(vid)
         return {"ok": True, "index": ctx.rag.status()}
 
@@ -426,7 +453,9 @@ def ai_router() -> APIRouter:
 
     @r.post("/ai/clear", status_code=204)
     def ai_clear(vid: str, request: Request):
-        _access(request, vid, "write").ai.clear(vid)
+        ctx = _access(request, vid, "write")
+        ctx.limiter.check(Limit(RateLimiter.key("ai-clear", vid), 120, 3_600_000))
+        ctx.ai.clear(vid)
         return Response(status_code=204)
 
     @r.get("/changes")
@@ -454,6 +483,7 @@ def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> 
 
     app = FastAPI(title="obsi-mcp", version=__version__, lifespan=lifespan)
     app.state.ctx = ctx
+    app.add_middleware(BodyLimitMiddleware, max_body_bytes=config.max_body_bytes)
     app.add_middleware(CORSMiddleware, allow_origins=config.cors_origins,
                        allow_methods=["GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"],
                        allow_headers=["Authorization", "Content-Type", "X-*", "x-mtime", "x-mtime-cli", "x-ctime-cli", "x-obsi-markdown"],
@@ -465,6 +495,8 @@ def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> 
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, e: ApiError):
         hdr = {"WWW-Authenticate": "Bearer"} if e.status == 401 else None
+        if e.status == 429:
+            hdr = {"Retry-After": str(e.extra["retry_after_seconds"])}
         return err_json(e.status, e.code, e.message, e.extra, hdr)
 
     @app.exception_handler(RequestValidationError)
@@ -495,10 +527,22 @@ def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> 
             raise ApiError(401, "unauthorized", "missing, invalid or revoked token")
         if tok.kind != "mcp":
             raise ApiError(403, "forbidden", "an mcp token is required")
+        _token_limit(ctx, tok)
         try:
             payload = json.loads(await read_body(request, 8 * 1024 * 1024))
         except ValueError:
             return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, 400)
+        cost = len(payload) if isinstance(payload, list) else 1
+        if cost > 100:
+            raise ApiError(413, "batch_too_large", "MCP batch exceeds 100 messages")
+        if cost:
+            ctx.limiter.check(Limit(RateLimiter.key("mcp", tok.id), 600, 60_000, cost))
+        calls = payload if isinstance(payload, list) else [payload]
+        searches = sum(isinstance(m, dict) and m.get("method") == "tools/call" and
+                       isinstance(m.get("params"), dict) and m["params"].get("name") == "search"
+                       for m in calls)
+        if searches:
+            ctx.limiter.check(Limit(RateLimiter.key("mcp-search", tok.id), 120, 60_000, searches))
         res = await run_in_threadpool(ctx.mcp.handle, tok, payload)
         return Response(status_code=202) if res is None else JSONResponse(res)
 

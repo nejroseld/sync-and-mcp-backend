@@ -65,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
 
         from .app import create_app
 
-        uvicorn.run(create_app(cfg), host=args.host or cfg.host, port=args.port or cfg.port)
+        uvicorn.run(create_app(cfg), host=args.host or cfg.host, port=args.port or cfg.port,
+                    proxy_headers=True, forwarded_allow_ips="127.0.0.1,::1")
         return 0
 
     ctx = build_context(cfg)

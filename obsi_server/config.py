@@ -19,6 +19,7 @@ class Config:
     mcp: bool = True
     rag: bool = True
     max_body_bytes: int = 200 * 1024 * 1024
+    sync_requests_per_minute: int = 6000
     rag_worker: bool = True  # background embedding thread
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
     s3_bucket: str | None = None
@@ -56,6 +57,8 @@ class Config:
                 cfg.set_features(",".join(s["features"]))
             if "max_body_mb" in s:
                 cfg.max_body_bytes = int(s["max_body_mb"]) * 1024 * 1024
+            if "sync_requests_per_minute" in s:
+                cfg.sync_requests_per_minute = int(s["sync_requests_per_minute"])
             cfg.rag_worker = bool(s.get("rag_worker", cfg.rag_worker))
             cfg.s3_bucket = s.get("s3_bucket", cfg.s3_bucket)
             cfg.s3_region = s.get("s3_region", cfg.s3_region)
@@ -70,6 +73,8 @@ class Config:
             cfg.set_features(env["OBSI_FEATURES"])
         if "OBSI_MAX_BODY_MB" in env:
             cfg.max_body_bytes = int(env["OBSI_MAX_BODY_MB"]) * 1024 * 1024
+        if "OBSI_SYNC_REQUESTS_PER_MINUTE" in env:
+            cfg.sync_requests_per_minute = int(env["OBSI_SYNC_REQUESTS_PER_MINUTE"])
         if "OBSI_RAG_WORKER" in env:
             cfg.rag_worker = env["OBSI_RAG_WORKER"].lower() not in ("0", "false", "no", "")
         if "OBSI_CORS_ORIGINS" in env:
@@ -82,4 +87,6 @@ class Config:
             cfg.s3_threshold_mb = int(env["OBSI_S3_THRESHOLD_MB"])
         if cfg.s3_threshold_mb < 0:
             raise ValueError("s3_threshold_mb must be non-negative")
+        if cfg.sync_requests_per_minute < 1:
+            raise ValueError("sync_requests_per_minute must be positive")
         return cfg

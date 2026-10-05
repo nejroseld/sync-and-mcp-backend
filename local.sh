@@ -4,6 +4,7 @@
 # Optional S3: set OBSI_S3_BUCKET (or s3_bucket in OBSI_CONFIG); boto3 is installed only then.
 set -euo pipefail
 cd "$(dirname "$0")"
+umask 077
 
 HOST="${OBSI_HOST:-127.0.0.1}"
 PORT="${OBSI_PORT:-8766}"
@@ -31,6 +32,10 @@ obsi() { .venv/bin/obsi-server --data-dir "$DATA" "$@"; }
 token_of() { sed -n '/{/,$p' | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 
 mkdir -p "$DATA"
+chmod 700 "$DATA"
+# The data directory may predate this launcher and contain credentials or vault data.
+find "$DATA" -type d -exec chmod 700 {} +
+find "$DATA" -type f -exec chmod 600 {} +
 if [ "$(obsi admin list-tokens)" = "[]" ]; then
   echo "==> First run: creating admin access and a first user invitation"
   ADMIN=$(obsi admin create-token --kind admin --name admin | token_of token)
@@ -40,7 +45,6 @@ if [ "$(obsi admin list-tokens)" = "[]" ]; then
 Server: $URL
 Code: $INVITE
 In Obsidian: Obsi Sync → \"I have an invitation\", paste this whole message."
-  umask 077
   cat > "$DATA/TOKENS.txt" <<EOF
 obsi-mcp local server
 URL:     $URL
