@@ -546,7 +546,7 @@ line()  { printf '  %s│%s %s\n' "$ACC" "$R" "$1"; }
 dim()   { line "$DIM$1$R"; }
 
 show_credentials() {
-  local admin device mcp vault url
+  local admin device mcp vault invite url
   ensure_connected || return 1
   TOKENS=$(as_root "cat $REMOTE_DATA/TOKENS.txt" </dev/null 2>/dev/null) || {
     bad "$(m tokens_missing)"
@@ -555,6 +555,7 @@ show_credentials() {
   }
   vault=$(printf '%s\n' "$TOKENS" | awk '/^Vault:/ {print $2; exit}')
   admin=$(field 'Admin token:')
+  invite=$(field 'First user invitation (one use):')
   device=$(field 'Device token')
   mcp=$(field 'MCP token:')
   TOKENS=
@@ -567,15 +568,23 @@ show_credentials() {
   fi
   block "$(m cred_plugin)"
   row "$(m cred_server_url)" "$url"
-  row "$(m cred_user_token)" "$device"
-  row "$(m cred_vault)" "Personal $DIM($vault)$R"
+  if [[ -n $invite ]]; then
+    row "$(m cred_invite)" "$invite"
+    dim "$(m cred_invite_note)"
+  fi
+  if [[ -n $device ]]; then
+    row "$(m cred_user_token)" "$device"
+    row "$(m cred_vault)" "Personal $DIM($vault)$R"
+  fi
   dim "$(m cred_password_note)"
 
-  block "$(m cred_mcp)"
-  row "$(m cred_url)" "$url/mcp"
-  row "$(m cred_header)" "Authorization: Bearer $mcp"
-  dim "$(m cred_example)"
-  line "claude mcp add --transport http obsi $url/mcp --header \"Authorization: Bearer $mcp\""
+  if [[ -n $mcp ]]; then
+    block "$(m cred_mcp)"
+    row "$(m cred_url)" "$url/mcp"
+    row "$(m cred_header)" "Authorization: Bearer $mcp"
+    dim "$(m cred_example)"
+    line "claude mcp add --transport http obsi $url/mcp --header \"Authorization: Bearer $mcp\""
+  fi
 
   block "$(m cred_admin)"
   line "$admin"
@@ -588,6 +597,24 @@ show_credentials() {
   line "$(m cred_more_4)"
   dim "$(m cred_more_5)"
   printf '\n'
+}
+
+server_admin() { # fixed CLI subcommand; optional validated invitation name
+  as_root "runuser -u obsi-mcp -- /opt/obsi-mcp/venv/bin/obsi-server --data-dir /var/lib/obsi-mcp admin $1"
+}
+
+users_menu() {
+  local name
+  ensure_connected || return 1
+  printf '\n'
+  say "$(m users_intro)"
+  server_admin list-users </dev/null || { bad "$(m users_load_failed)"; return 1; }
+  printf '\n'
+  ask name "$(m users_invite_name)"
+  [[ -n $name ]] || return 0
+  [[ $name =~ ^[a-zA-Z0-9._-]+$ ]] || { bad "$(m users_bad_name)"; return 1; }
+  server_admin "create-invite --name '$name'" </dev/null || { bad "$(m users_invite_failed)"; return 1; }
+  note "$(m users_code_once)"
 }
 
 celebrate() {
@@ -772,6 +799,7 @@ menu() {
     item 6 "$(m menu_s3)" "$(m menu_s3_hint)"
     item 7 "$(m menu_harden)"
     item 8 "$(m menu_other)"
+    item 9 "$(m menu_users)"
     item 0 "$(m menu_exit)"
     printf '\n'
     ask choice "$(m menu_choose)" "$def"
@@ -784,6 +812,7 @@ menu() {
       6) configure_s3 ;;
       7) harden_ssh ;;
       8) close_master; wizard ;;
+      9) users_menu; pause ;;
       0|q|й|exit) return 0 ;;
       *) bad "$(m menu_unknown)" ;;
     esac

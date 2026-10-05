@@ -23,6 +23,7 @@
 * `GET /api/v1/vaults` для пользователя показывает его vault'ы и vault'ы, явно выданные через legacy-гранты.
 
 Admin управляет приглашениями (`kind=admin`): `POST /api/v1/admin/invites` `{"name":"signup"}` возвращает code единожды; `GET /api/v1/admin/invites` возвращает список без кодов.
+`GET /api/v1/admin/users` возвращает зарегистрированных пользователей и количества принадлежащих им vault'ов и пользовательских токенов: `{"users":[{"id":"u_...","username":"alice","created_at":1730000000000,"vault_count":1,"token_count":2}]}`. Доступен только admin-токен.
 
 ### `GET /api/v1/vaults`
 Vault'ы, на которые у токена есть хоть один грант (admin — все):

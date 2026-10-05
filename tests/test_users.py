@@ -1,3 +1,11 @@
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
+
+from obsi_server.cli import main
 from helpers import ServerCase
 
 
@@ -71,3 +79,32 @@ class UserAccountTests(ServerCase):
         r = self.client.get(f"/api/v1/vaults/{self.vid}/files", headers=self.h(self.dev))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.client.get("/api/v1/vaults", headers=self.h(self.admin)).status_code, 200)
+
+    def test_admin_user_list_includes_owned_vaults_and_user_tokens(self):
+        invite = self.client.post("/api/v1/admin/invites", headers=self.h(self.admin), json={"name": "signup"}).json()
+        alice = self.register(invite["code"]).json()
+        user_headers = {"Authorization": "Bearer " + alice["token"]}
+        self.client.post("/api/v1/vaults", headers=user_headers, json={"name": "Private"})
+        response = self.client.get("/api/v1/admin/users", headers=self.h(self.admin))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["users"], [{
+            "id": alice["user"]["id"], "username": "alice", "created_at": alice["user"]["created_at"],
+            "vault_count": 1, "token_count": 1,
+        }])
+        self.assertEqual(self.client.get("/api/v1/admin/users", headers=self.h(self.dev)).status_code, 403)
+
+
+class UserAdminCliTests(unittest.TestCase):
+    def test_admin_cli_create_invite_and_list_commands(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            def run(*args):
+                out, err = io.StringIO(), io.StringIO()
+                with patch.dict("os.environ", {"OBSI_FEATURES": "none"}), redirect_stdout(out), redirect_stderr(err):
+                    code = main(["--data-dir", data_dir, "admin", *args])
+                self.assertEqual(code, 0, err.getvalue())
+                return json.loads(out.getvalue())
+
+            invite = run("create-invite", "--name", "CLI signup")
+            self.assertTrue(invite["code"].startswith("inv_"))
+            self.assertEqual(run("list-invites")[0]["name"], "CLI signup")
+            self.assertEqual(run("list-users"), [])

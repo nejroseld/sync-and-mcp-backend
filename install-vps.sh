@@ -125,26 +125,20 @@ TOKENS_FILE=$DATA_DIR/TOKENS.txt
 if [[ -f $TOKENS_FILE ]]; then
   echo "Existing credentials preserved in $TOKENS_FILE"
 elif [[ $(obsi admin list-tokens | json_count) == 0 ]]; then
-  [[ $(obsi admin list-vaults | json_count) == 0 ]] || die 'Vaults already exist; create tokens manually for the existing vault'
-  echo 'Creating initial vault and tokens'
-  VAULT=$(obsi admin create-vault --name Personal | json_field id)
+  echo 'Creating admin access and the first user invitation'
   ADMIN=$(obsi admin create-token --kind admin --name admin | json_field token)
-  DEVICE=$(obsi admin create-token --kind device --name device --vault "$VAULT" --ops read,write | json_field token)
-  MCP=$(obsi admin create-token --kind mcp --name mcp --vault "$VAULT" --ops list,search,read,write | json_field token)
+  INVITE=$(obsi admin create-invite --name first-user | json_field code)
   umask 077
   cat > "$TOKENS_FILE" <<EOF
-Vault: $VAULT
-
 Admin token:
 $ADMIN
 
-Device token (Obsidian plugin):
-$DEVICE
-
-MCP token:
-$MCP
+First user invitation (one use):
+$INVITE
 
 Local MCP endpoint: http://127.0.0.1:$PORT/mcp
+In Obsidian, choose Create account, enter the invitation, then create your own vault.
+For another user: sudo -u $APP_USER $APP_DIR/venv/bin/obsi-server --data-dir $DATA_DIR admin create-invite --name NAME
 Publish the service through a TLS reverse proxy before connecting from another machine.
 EOF
   chmod 0600 "$TOKENS_FILE"
@@ -183,4 +177,5 @@ systemctl restart obsi-mcp.service
 echo "Service: $(systemctl is-active obsi-mcp.service)"
 echo "Health: http://127.0.0.1:$PORT/api/v1/health"
 echo "Credentials: sudo cat $TOKENS_FILE"
+echo "Add a user: sudo -u $APP_USER $APP_DIR/venv/bin/obsi-server --data-dir $DATA_DIR admin create-invite --name NAME"
 echo 'Logs: sudo journalctl -u obsi-mcp -f'

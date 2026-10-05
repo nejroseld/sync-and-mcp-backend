@@ -227,6 +227,10 @@ def user_auth_router() -> APIRouter:
 def admin_router() -> APIRouter:
     r = APIRouter(prefix="/admin", dependencies=[Depends(auth("admin"))])
 
+    @r.get("/users")
+    def list_users(request: Request):
+        return {"users": get_ctx(request).auth.list_users()}
+
     @r.post("/invites")
     def create_invite(body: VaultIn, request: Request):
         return get_ctx(request).auth.create_invite(body.name)

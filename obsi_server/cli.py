@@ -22,6 +22,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host")
     s.add_argument("--port", type=int)
     a = sub.add_parser("admin", help="management commands").add_subparsers(dest="acmd", required=True)
+    ci = a.add_parser("create-invite", help="create a one-use user registration invite")
+    ci.add_argument("--name", required=True)
+    a.add_parser("list-users", help="list registered user accounts")
+    a.add_parser("list-invites", help="list registration invites (codes are never shown)")
     t = a.add_parser("create-token")
     t.add_argument("--kind", choices=["device", "mcp", "admin"], required=True)
     t.add_argument("--name", required=True)
@@ -67,7 +71,15 @@ def main(argv: list[str] | None = None) -> int:
     ctx = build_context(cfg)
     try:
         c = args.acmd
-        if c == "create-token":
+        if c == "create-invite":
+            invite = ctx.auth.create_invite(args.name)
+            _out(invite)
+            print("Save the invite code now: it is shown only once.", file=sys.stderr)
+        elif c == "list-users":
+            _out(ctx.auth.list_users())
+        elif c == "list-invites":
+            _out(ctx.auth.list_invites())
+        elif c == "create-token":
             grants = {vid: _ops(args.ops) for vid in args.vault}
             tok, plain = ctx.auth.create(args.name, args.kind, grants)
             _out({**tok.public(), "token": plain})

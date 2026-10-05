@@ -93,6 +93,16 @@ class AuthService:
     def list_invites(self) -> list[dict]:
         return [dict(r) for r in self.db.query("SELECT id,name,created_at,used_at FROM invites ORDER BY created_at,id")]
 
+    def list_users(self) -> list[dict]:
+        """List accounts with their owned vault and user-token counts."""
+        rows = self.db.query(
+            """SELECT u.id,u.username,u.created_at,
+                      (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id=u.id) AS vault_count,
+                      (SELECT COUNT(*) FROM tokens t WHERE t.user_id=u.id) AS token_count
+               FROM users u ORDER BY u.created_at,u.id"""
+        )
+        return [dict(row) for row in rows]
+
     def register(self, invite_code: str, username: str, password: str) -> tuple[dict, str]:
         norm = self.normalize_username(username)
         if len(norm) < 3 or len(norm) > 64 or any(ord(c) < 32 for c in norm):

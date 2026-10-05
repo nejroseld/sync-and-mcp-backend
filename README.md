@@ -4,6 +4,29 @@
 plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и строит поиск (FTS5 + эмбеддинги).
 Контракт описан в `docs/API.md`, архитектура в `docs/ARCHITECTURE.md`.
 
+## Несколько пользователей
+
+Каждый пользователь регистрирует отдельную учётную запись и создаёт собственные vault'ы.
+Администратор выдаёт одноразовое приглашение; для второго и следующих пользователей повторяет
+команду с другим именем:
+
+```bash
+obsi-server --data-dir ./data admin create-invite --name alice
+obsi-server --data-dir ./data admin create-invite --name bob
+obsi-server --data-dir ./data admin list-users
+```
+
+Код показывается один раз. Пользователь открывает мастер Obsi Sync, выбирает «Создать аккаунт»,
+вводит код, логин и пароль, затем создаёт свой серверный vault и отдельный пароль шифрования.
+При следующем подключении выбирает «Войти». Пользователь видит только свои vault'ы и те,
+к которым администратор явно выдал доступ. В плагине администратор может создавать
+приглашения и смотреть список учётных записей во вкладке «Сервер».
+
+На новой установке `local.sh` и `install-vps.sh` создают admin-токен и первое приглашение.
+На уже установленном сервере данные и старые токены сохраняются; для новых пользователей
+создайте приглашения командой выше (для VPS используйте `--data-dir /var/lib/obsi-mcp`
+и пользователя сервиса). Общие vault'ы и токены с грантами продолжают работать.
+
 Зависимости: Python 3.11+, `fastapi`, `uvicorn`, `httpx`. Для S3 установите `pip install -e '.[s3]'`.
 Всё остальное стандартная библиотека
 (sqlite3 с FTS5). `numpy` необязателен: если установлен, косинус считается быстрее.
@@ -35,15 +58,14 @@ plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и с
    (`scripts/setup-https.sh`; при активном `ufw` открывает порты 80 и 443). Ответ «нет»
    оставляет сервер без HTTPS: тогда он доступен только через SSH-туннель из меню.
 4. **Установка.** Код загружается на VPS и ставится через `install-vps.sh` без вопросов
-   (S3 не настраивается). В конце скрипт проверяет `/api/v1/health` и показывает три токена:
-   токен пользователя с адресом сервера для плагина Obsi Sync, MCP-токен с URL и заголовком
-   `Authorization` для любого MCP-клиента (с примером для Claude Code) и токен
-   администратора. Там же есть инструкция, как выпускать новые токены и приглашения
-   пользователей в плагине: Obsi Sync → «Сервер» → «Доступ администратора».
+   (S3 не настраивается). В конце скрипт проверяет `/api/v1/health` и показывает
+   admin-токен и первое одноразовое приглашение. Пользователь вводит приглашение в мастере
+   Obsi Sync и создаёт собственную учётную запись и vault. Новые приглашения можно
+   выдавать в плагине: Obsi Sync → «Сервер» → «Пользователи и приглашения».
 
 Последующие запуски открывают меню. По Enter выполняется пункт по умолчанию (обновление
 сервера). В меню также есть данные для подключения, состояние и логи, домен и HTTPS,
-SSH-туннель, S3, отключение входа по паролю и переход на другой сервер. При обновлении
+SSH-туннель, S3, управление пользователями, отключение входа по паролю и переход на другой сервер. При обновлении
 настроенный S3 сохраняется. Параметры подключения хранятся в `~/.config/obsi-mcp/vps.conf`
 с правами `0600`, пароли туда не пишутся. Журнал последней ошибки сохраняется в
 `~/.config/obsi-mcp/last-error.log`. Переменная `NO_COLOR=1` отключает цвета и анимацию.
@@ -69,7 +91,7 @@ sudo ./install-vps.sh
 
 Скрипт устанавливает Python 3.11+ и зависимости в `/opt/obsi-mcp/venv`, создаёт отдельного
 системного пользователя и сервис `obsi-mcp.service`. Данные хранятся в `/var/lib/obsi-mcp`.
-При первой установке создаются vault `Personal` и токены; прочитать их можно командой
+При первой установке создаются admin-токен и первое приглашение; прочитать их можно командой
 `sudo cat /var/lib/obsi-mcp/TOKENS.txt`. Повторный запуск обновляет приложение и сервис, сохраняя
 данные и ранее выданные токены. Настройки S3 и необязательные ключи доступа сохраняются
 в `/etc/obsi-mcp/s3.env` с правами `0600`; при отсутствии этого файла используется только
@@ -86,8 +108,8 @@ sudo ./install-vps.sh
 ./local.sh
 ```
 
-При первом запуске создаёт `.venv`, ставит зависимости, заводит vault `Personal`, admin-, device- и
-MCP-токены и пишет их в `data/TOKENS.txt` (вместе с командой для Claude Code и командами отладки).
+При первом запуске создаёт `.venv`, ставит зависимости, заводит admin-токен и первое
+приглашение и пишет их в `data/TOKENS.txt`.
 Затем запускает сервер на `http://127.0.0.1:8766`. Повторные запуски просто стартуют сервер.
 Переопределить: `OBSI_PORT=9000 OBSI_HOST=0.0.0.0 OBSI_DATA_DIR=~/obsi-data ./local.sh`.
 Для локального S3 задайте `OBSI_S3_BUCKET` (или `s3_bucket` в файле `OBSI_CONFIG`) и при необходимости `OBSI_S3_REGION`,
@@ -128,23 +150,22 @@ curl http://127.0.0.1:8766/api/v1/health
 Для телефона в локальной сети: `--host 0.0.0.0` и открыть порт в firewall
 (`sudo firewall-cmd --add-port=8766/tcp`).
 
-**4. Создать vault и токены** (в другом терминале, с тем же `--data-dir`; сервер можно не
+**4. Создать admin-токен и приглашение** (в другом терминале, с тем же `--data-dir`; сервер можно не
 останавливать):
 
 ```bash
 . .venv/bin/activate
 obsi-server --data-dir ./data admin create-token --kind admin --name root
-obsi-server --data-dir ./data admin create-vault --name Personal          # -> v_XXX
-obsi-server --data-dir ./data admin create-token --kind device --name laptop --vault v_XXX --ops read,write
-obsi-server --data-dir ./data admin create-token --kind mcp --name claude --vault v_XXX --ops list,search,read,write
+obsi-server --data-dir ./data admin create-invite --name alice
 ```
 
 Токены показываются один раз — сохраните их.
 
 **5. Плагин в Obsidian:** в отдельном репозитории плагина выполните `npm install && npm run build`,
 затем скопируйте `main.js`, `manifest.json`, `styles.css` в `<vault>/.obsidian/plugins/obsi-sync/`,
-включить в Settings → Community plugins. В настройках плагина: Server URL `http://127.0.0.1:8766`,
-device-токен, mount с пустым путём → vault `Personal`, свой пароль шифрования.
+включить в Settings → Community plugins. В мастере плагина: Server URL
+`http://127.0.0.1:8766`, «Создать аккаунт», полученный код приглашения, логин и пароль;
+затем создать vault и ввести отдельный пароль шифрования.
 
 **6. MCP в Claude Code:**
 
@@ -193,16 +214,15 @@ python3 -m obsi_server --data-dir ./data serve --host 0.0.0.0 --port 8765
 ## Быстрый старт
 
 ```bash
-python3 -m obsi_server --data-dir ./data admin create-token --kind admin --name root          # админ-токен (показывается один раз)
-python3 -m obsi_server --data-dir ./data admin create-vault --name Personal                   # -> id вида v_xxxxxxxxxxxxxxxx
-python3 -m obsi_server --data-dir ./data admin create-token --kind device --name laptop --vault v_XXX --ops read,write
-python3 -m obsi_server --data-dir ./data admin create-token --kind mcp --name claude --vault v_XXX --ops list,search,read,write
+python3 -m obsi_server --data-dir ./data admin create-token --kind admin --name root
+python3 -m obsi_server --data-dir ./data admin create-invite --name alice
+python3 -m obsi_server --data-dir ./data admin list-users
 ```
 
-Device-токен и id vault'а вводятся в плагине. Дальше всё то же доступно через admin REST API
-(`/api/v1/admin/...`) с admin-токеном.
+Для общей папки или MCP-клиента можно отдельно создать vault и токен с грантами через CLI
+или admin REST API (`/api/v1/admin/...`).
 
-Другие команды: `list-vaults`, `list-tokens`, `revoke TOKEN_ID`, `grant TOKEN_ID --vault V --ops a,b`,
+Другие команды: `list-invites`, `list-vaults`, `list-tokens`, `revoke TOKEN_ID`, `grant TOKEN_ID --vault V --ops a,b`,
 `rag-enable V`, `rag-disable V`, `reindex V`,
 `set-embedding --base-url http://localhost:11434/v1 --api-key KEY --model nomic-embed-text`.
 Смена `model` или `base-url` сбрасывает векторы, индекс перестраивается в фоне (работающий сервер

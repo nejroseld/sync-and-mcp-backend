@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local one-click run: venv + deps, first-run bootstrap (vault + tokens -> data/TOKENS.txt), serve.
+# Local one-click run: venv + deps, first-run admin token and invitation, serve.
 # Overrides: OBSI_HOST (127.0.0.1), OBSI_PORT (8766), OBSI_DATA_DIR (./data), PYTHON (python3).
 # Optional S3: set OBSI_S3_BUCKET (or s3_bucket in OBSI_CONFIG); boto3 is installed only then.
 set -euo pipefail
@@ -32,40 +32,33 @@ token_of() { sed -n '/{/,$p' | .venv/bin/python -c 'import json,sys; print(json.
 
 mkdir -p "$DATA"
 if [ "$(obsi admin list-tokens)" = "[]" ]; then
-  echo "==> First run: creating vault 'Personal' and tokens"
+  echo "==> First run: creating admin access and a first user invitation"
   ADMIN=$(obsi admin create-token --kind admin --name admin | token_of token)
-  VAULT=$(obsi admin create-vault --name Personal | token_of id)
-  DEVICE=$(obsi admin create-token --kind device --name device --vault "$VAULT" --ops read,write | token_of token)
-  MCP=$(obsi admin create-token --kind mcp --name claude --vault "$VAULT" --ops list,search,read,write | token_of token)
+  INVITE=$(obsi admin create-invite --name first-user | token_of code)
   URL="http://127.0.0.1:$PORT"
   umask 077
   cat > "$DATA/TOKENS.txt" <<EOF
 obsi-mcp local server
 URL:     $URL
 
-VAULT (Personal):  $VAULT
-
 ADMIN token:
 $ADMIN
 
-DEVICE token (read+write):
-$DEVICE
+First user invitation (one use):
+$INVITE
 
-MCP token (list/search/read/write):
-$MCP
-
-Obsidian plugin: Server URL $URL, device token above, mount with empty path -> vault Personal,
-your own encryption password.
-
-Claude Code:
-claude mcp add --transport http obsi $URL/mcp --header "Authorization: Bearer $MCP"
+Obsidian plugin: choose Create account, enter this invitation, a username and an account
+password. Then create your own server vault and choose a separate encryption password.
+For another user, run: obsi-server --data-dir "$DATA" admin create-invite --name NAME
+For an AI assistant, create an MCP token with a grant on a chosen vault.
 
 Debug:
 curl -v $URL/api/v1/health
-curl -v -H "Authorization: Bearer $DEVICE" $URL/api/v1/me
+curl -v -H "Authorization: Bearer $ADMIN" $URL/api/v1/me
 EOF
   echo "==> Tokens saved to $DATA/TOKENS.txt"
 fi
 
 echo "==> obsi-mcp on http://$HOST:$PORT  (data: $DATA, tokens: $DATA/TOKENS.txt)  Ctrl+C to stop"
+echo "==> Add a user: .venv/bin/obsi-server --data-dir '$DATA' admin create-invite --name NAME"
 exec .venv/bin/obsi-server --data-dir "$DATA" serve --host "$HOST" --port "$PORT"
