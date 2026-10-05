@@ -36,6 +36,10 @@ if [ "$(obsi admin list-tokens)" = "[]" ]; then
   ADMIN=$(obsi admin create-token --kind admin --name admin | token_of token)
   INVITE=$(obsi admin create-invite --name first-user | token_of code)
   URL="http://127.0.0.1:$PORT"
+  MESSAGE="Obsi Sync invitation
+Server: $URL
+Code: $INVITE
+In Obsidian: Obsi Sync → \"I have an invitation\", paste this whole message."
   umask 077
   cat > "$DATA/TOKENS.txt" <<EOF
 obsi-mcp local server
@@ -47,8 +51,11 @@ $ADMIN
 First user invitation (one use):
 $INVITE
 
-Obsidian plugin: choose Create account, enter this invitation, a username and an account
-password. Then create your own server vault and choose a separate encryption password.
+Invitation message (forward it to the first user, or paste it into Obsi Sync yourself):
+$MESSAGE
+
+The user then picks a username and an account password, creates their own server vault
+and chooses a separate encryption password.
 For another user, run: obsi-server --data-dir "$DATA" admin create-invite --name NAME
 For an AI assistant, create an MCP token with a grant on a chosen vault.
 
@@ -57,6 +64,7 @@ curl -v $URL/api/v1/health
 curl -v -H "Authorization: Bearer $ADMIN" $URL/api/v1/me
 EOF
   echo "==> Tokens saved to $DATA/TOKENS.txt"
+  printf '==> First user invitation (one use), forward this whole message:\n\n%s\n\n' "$MESSAGE"
 fi
 
 echo "==> obsi-mcp on http://$HOST:$PORT  (data: $DATA, tokens: $DATA/TOKENS.txt)  Ctrl+C to stop"

@@ -568,15 +568,16 @@ show_credentials() {
   fi
   block "$(m cred_plugin)"
   row "$(m cred_server_url)" "$url"
-  if [[ -n $invite ]]; then
-    row "$(m cred_invite)" "$invite"
-    dim "$(m cred_invite_note)"
-  fi
   if [[ -n $device ]]; then
     row "$(m cred_user_token)" "$device"
     row "$(m cred_vault)" "Personal $DIM($vault)$R"
   fi
   dim "$(m cred_password_note)"
+  if [[ -n $invite ]]; then
+    block "$(m cred_invite)"
+    invite_message "$url" "$invite"
+    note "$(m cred_invite_note)"
+  fi
 
   if [[ -n $mcp ]]; then
     block "$(m cred_mcp)"
@@ -599,22 +600,78 @@ show_credentials() {
   printf '\n'
 }
 
+# A ready-to-forward invitation: Obsi Sync finds the server URL and the inv_ code in any pasted text.
+invite_message() { # URL CODE [NAME]
+  local title
+  if [[ -n ${3:-} ]]; then title=$(m invite_title_for "$3"); else title=$(m invite_title); fi
+  printf '\n'
+  printf '    %s\n' "$title" "$(m invite_server "$1")" "$(m invite_code "$2")" "$(m invite_howto)"
+  printf '\n'
+}
+
 server_admin() { # fixed CLI subcommand; optional validated invitation name
   as_root "runuser -u obsi-mcp -- /opt/obsi-mcp/venv/bin/obsi-server --data-dir /var/lib/obsi-mcp admin $1"
 }
 
+# Turns a JSON list (or object) on stdin into tab-separated FIELDS, one row per item.
+# Used invitations are skipped; *_at timestamps become dates.
+JSON_ROWS='import json,sys,time
+d=json.load(sys.stdin)
+for r in d if isinstance(d,list) else [d]:
+    if not r.get("used_at"):
+        print("\t".join(time.strftime("%Y-%m-%d",time.localtime(r[k]/1000)) if k.endswith("_at") else str(r[k]) for k in sys.argv[1:]))'
+
+admin_rows() { # SUBCOMMAND FIELD...
+  local cmd=$1
+  shift
+  server_admin "$cmd" </dev/null | remote_in "/opt/obsi-mcp/venv/bin/python -c '$JSON_ROWS' $*"
+}
+
+table() { # ROWS HEADER... — tab-separated ROWS as aligned columns under a dim header
+  local rows i s pad first=1 cells w=()
+  rows=$(IFS=$'\t'; printf '%s' "${*:2}")$'\n'$1
+  while IFS=$'\t' read -r -a cells; do
+    for i in "${!cells[@]}"; do (( ${#cells[i]} > ${w[i]:-0} )) && w[i]=${#cells[i]}; done
+  done <<< "$rows"
+  while IFS=$'\t' read -r -a cells; do
+    s=
+    for i in "${!cells[@]}"; do printf -v pad '%*s' $(( w[i] - ${#cells[i]} + 3 )) ''; s+=${cells[i]}$pad; done
+    s=${s%"${s##*[! ]}"}
+    if (( first )); then dim "$s"; first=0; else line "$s"; fi
+  done <<< "$rows"
+}
+
 users_menu() {
-  local name
+  local users invites name code
   ensure_connected || return 1
-  printf '\n'
-  say "$(m users_intro)"
-  server_admin list-users </dev/null || { bad "$(m users_load_failed)"; return 1; }
-  printf '\n'
-  ask name "$(m users_invite_name)"
-  [[ -n $name ]] || return 0
-  [[ $name =~ ^[a-zA-Z0-9._-]+$ ]] || { bad "$(m users_bad_name)"; return 1; }
-  server_admin "create-invite --name '$name'" </dev/null || { bad "$(m users_invite_failed)"; return 1; }
-  note "$(m users_code_once)"
+  if ! users=$(admin_rows list-users username created_at vault_count token_count) ||
+     ! invites=$(admin_rows list-invites name created_at); then
+    bad "$(m users_load_failed)"; return 1
+  fi
+  block "$(m users_title)"
+  if [[ -n $users ]]; then
+    table "$users" "$(m users_col_name)" "$(m users_col_created)" "$(m users_col_vaults)" "$(m users_col_tokens)"
+  else
+    dim "$(m users_none)"
+  fi
+  block "$(m invites_title)"
+  if [[ -n $invites ]]; then
+    table "$invites" "$(m users_col_name)" "$(m invites_col_created)"
+  else
+    dim "$(m invites_none)"
+  fi
+  while true; do
+    printf '\n'
+    ask name "$(m users_invite_name)"
+    [[ -n $name ]] || return 0
+    [[ $name =~ ^[a-zA-Z0-9._-]+$ ]] || { bad "$(m users_bad_name)"; continue; }
+    code=$(server_admin "create-invite --name '$name'" </dev/null 2>/dev/null | grep -o 'inv_[A-Za-z0-9_-]*' | head -n 1)
+    [[ -n $code ]] || { bad "$(m users_invite_failed)"; return 1; }
+    block "$(m users_send "$name")"
+    invite_message "$(public_url)" "$code" "$name"
+    note "$(m users_code_once)"
+    [[ -n $DOMAIN ]] || warn "$(m invite_no_https "$(m menu_domain)")"
+  done
 }
 
 celebrate() {
@@ -812,7 +869,7 @@ menu() {
       6) configure_s3 ;;
       7) harden_ssh ;;
       8) close_master; wizard ;;
-      9) users_menu; pause ;;
+      9) users_menu ;;
       0|q|й|exit) return 0 ;;
       *) bad "$(m menu_unknown)" ;;
     esac

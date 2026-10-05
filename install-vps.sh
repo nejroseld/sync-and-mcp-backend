@@ -128,6 +128,10 @@ elif [[ $(obsi admin list-tokens | json_count) == 0 ]]; then
   echo 'Creating admin access and the first user invitation'
   ADMIN=$(obsi admin create-token --kind admin --name admin | json_field token)
   INVITE=$(obsi admin create-invite --name first-user | json_field code)
+  MESSAGE="Obsi Sync invitation
+Server: <your server address>
+Code: $INVITE
+In Obsidian: Obsi Sync → \"I have an invitation\", paste this whole message."
   umask 077
   cat > "$TOKENS_FILE" <<EOF
 Admin token:
@@ -136,13 +140,16 @@ $ADMIN
 First user invitation (one use):
 $INVITE
 
+Invitation message (put the public HTTPS address in place of <your server address>, then forward it):
+$MESSAGE
+
 Local MCP endpoint: http://127.0.0.1:$PORT/mcp
-In Obsidian, choose Create account, enter the invitation, then create your own vault.
 For another user: sudo -u $APP_USER $APP_DIR/venv/bin/obsi-server --data-dir $DATA_DIR admin create-invite --name NAME
 Publish the service through a TLS reverse proxy before connecting from another machine.
 EOF
   chmod 0600 "$TOKENS_FILE"
   echo "Credentials saved to $TOKENS_FILE (root access only)"
+  printf 'First user invitation (one use); set the server address and forward this whole message:\n\n%s\n\n' "$MESSAGE"
 else
   echo "Tokens already exist; $TOKENS_FILE is absent. Existing tokens cannot be recovered." >&2
 fi
