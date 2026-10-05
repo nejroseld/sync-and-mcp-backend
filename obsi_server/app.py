@@ -80,7 +80,7 @@ def vault_access(ctx: Context, tok: Token, vid: str, op: str) -> None:
     vault = ctx.vaults.get(vid)
     if not vault:
         ctx.vaults.require(vid)
-    owner_access = tok.kind == "device" and tok.user_id is not None and vault["owner_user_id"] == tok.user_id
+    owner_access = tok.is_session and tok.user_id is not None and vault["owner_user_id"] == tok.user_id
     if not owner_access and not tok.can(vid, op):
         raise ApiError(403, "forbidden", f"no '{op}' grant on this vault")
 
@@ -184,6 +184,7 @@ def core_router() -> APIRouter:
     def me(request: Request, tok: Token = Depends(auth())):
         user_row = get_ctx(request).db.one("SELECT * FROM users WHERE id=?", (tok.user_id,)) if tok.user_id else None
         return {"token_id": tok.id, "name": tok.name, "kind": tok.kind, "grants": tok.grants,
+                "account_token": tok.is_session,
                 **({"user": AuthService.public_user(user_row)} if user_row else {})}
 
     @r.get("/vaults")
@@ -194,16 +195,54 @@ def core_router() -> APIRouter:
         else:
             ids = {v for v in tok.grants if tok.has_any(v)}
             visible = ctx.vaults.list(ids)
-            if tok.user_id:
+            if tok.is_session and tok.user_id:
                 owned = ctx.vaults.list_owned(tok.user_id)
                 known = {v["id"] for v in visible}
                 visible.extend(v for v in owned if v["id"] not in known)
         return {"vaults": [{"id": v["id"], "name": v["name"], "created_at": v["created_at"],
+                            "owner_user_id": v["owner_user_id"],
                             "rag": {"enabled": v["rag"]["enabled"]}} for v in visible]}
+
+    @r.get("/tokens")
+    def user_tokens(request: Request, tok: Token = Depends(auth("device"))):
+        if not tok.is_session or not tok.user_id:
+            raise ApiError(403, "session_required", "account session token required")
+        return {"tokens": [t.public() for t in get_ctx(request).auth.list_user(tok.user_id)]}
+
+    @r.post("/tokens")
+    def create_user_token(body: TokenIn, request: Request, tok: Token = Depends(auth("device"))):
+        if not tok.is_session or not tok.user_id:
+            raise ApiError(403, "session_required", "account session token required")
+        if body.kind not in ("device", "mcp"):
+            raise ApiError(422, "invalid_kind", "user tokens must be kind=device or kind=mcp")
+        ctx = get_ctx(request)
+        for vid in body.grants:
+            vault = ctx.vaults.get(vid)
+            if not vault or vault["owner_user_id"] != tok.user_id:
+                raise ApiError(422, "unknown_vault", f"vault {vid} is not owned by this account")
+        created, plain = ctx.auth.create_user_token(tok.user_id, body.name, body.kind, body.grants)
+        return {**created.public(), "token": plain}
+
+    @r.patch("/tokens/{tid}")
+    def patch_user_token(tid: str, body: TokenPatch, request: Request, tok: Token = Depends(auth("device"))):
+        if not tok.is_session or not tok.user_id:
+            raise ApiError(403, "session_required", "account session token required")
+        ctx = get_ctx(request)
+        for vid in body.grants or {}:
+            vault = ctx.vaults.get(vid)
+            if not vault or vault["owner_user_id"] != tok.user_id:
+                raise ApiError(422, "unknown_vault", f"vault {vid} is not owned by this account")
+        return ctx.auth.update_user(tok.user_id, tid, body.name, body.grants).public()
+
+    @r.post("/tokens/{tid}/revoke")
+    def revoke_user_token(tid: str, request: Request, tok: Token = Depends(auth("device"))):
+        if not tok.is_session or not tok.user_id:
+            raise ApiError(403, "session_required", "account session token required")
+        return get_ctx(request).auth.revoke_user(tok.user_id, tid).public()
 
     @r.post("/vaults")
     def create_user_vault(body: VaultIn, request: Request, tok: Token = Depends(auth("device"))):
-        if not tok.user_id:
+        if not tok.is_session or not tok.user_id:
             raise ApiError(403, "user_account_required", "a registered user device token is required")
         return get_ctx(request).vaults.create(body.name, owner_user_id=tok.user_id)
     return r

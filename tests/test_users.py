@@ -1,11 +1,13 @@
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from obsi_server.cli import main
+from obsi_server.db import Database, MIGRATIONS
 from helpers import ServerCase
 
 
@@ -80,6 +82,60 @@ class UserAccountTests(ServerCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.client.get("/api/v1/vaults", headers=self.h(self.admin)).status_code, 200)
 
+    def test_account_tokens_are_scoped_and_self_managed(self):
+        invitation = self.client.post("/api/v1/admin/invites", headers=self.h(self.admin),
+                                      json={"name": "Alice"}).json()
+        alice = self.register(invitation["code"]).json()
+        ah = {"Authorization": "Bearer " + alice["token"]}
+        own = self.client.post("/api/v1/vaults", headers=ah, json={"name": "Owned"}).json()["id"]
+
+        invite_b = self.client.post("/api/v1/admin/invites", headers=self.h(self.admin),
+                                    json={"name": "Bob"}).json()
+        bob = self.register(invite_b["code"], "Bob").json()
+        bob_headers = {"Authorization": "Bearer " + bob["token"]}
+        bob_vault = self.client.post("/api/v1/vaults", headers=bob_headers,
+                                     json={"name": "Bob vault"}).json()["id"]
+
+        self.assertTrue(self.client.get("/api/v1/me", headers=ah).json()["account_token"])
+        self.assertEqual(self.client.post("/api/v1/tokens", headers=ah, json={
+            "name": "bad", "kind": "device", "grants": {bob_vault: ["read"]},
+        }).status_code, 422)
+        self.assertEqual(self.client.post("/api/v1/tokens", headers=ah, json={
+            "name": "admin escalation", "kind": "admin", "grants": {},
+        }).status_code, 422)
+        issued = self.client.post("/api/v1/tokens", headers=ah, json={
+            "name": "limited", "kind": "device", "grants": {own: ["read"]},
+        })
+        self.assertEqual(issued.status_code, 200, issued.text)
+        delegated = issued.json()
+        dh = {"Authorization": "Bearer " + delegated["token"]}
+        self.assertFalse(self.client.get("/api/v1/me", headers=dh).json()["account_token"])
+        self.assertEqual(self.client.post("/api/v1/vaults", headers=dh, json={"name": "Nope"}).status_code, 403)
+        self.assertEqual(self.client.get(f"/api/v1/vaults/{own}/files", headers=dh).status_code, 200)
+        self.assertEqual(self.client.put(f"/api/v1/vaults/{own}/files/note", headers=dh,
+                                        content=b"blocked").status_code, 403)
+        self.assertEqual(self.client.get(f"/api/v1/vaults/{bob_vault}/files", headers=dh).status_code, 403)
+        self.assertEqual([v["id"] for v in self.client.get("/api/v1/vaults", headers=dh).json()["vaults"]], [own])
+        self.assertEqual(self.client.get("/api/v1/tokens", headers=dh).status_code, 403)
+        self.assertEqual(self.client.patch(f"/api/v1/tokens/{delegated['id']}", headers=bob_headers,
+                                           json={"name": "stolen"}).status_code, 404)
+        self.assertEqual(self.client.post(f"/api/v1/tokens/{delegated['id']}/revoke", headers=bob_headers).status_code, 404)
+        self.assertEqual(self.client.patch(f"/api/v1/tokens/{delegated['id']}", headers=ah,
+                                           json={"grants": {bob_vault: ["read"]}}).status_code, 422)
+        mcp_created = self.client.post("/api/v1/tokens", headers=ah, json={
+            "name": "MCP", "kind": "mcp", "grants": {own: ["list", "read"]},
+        }).json()
+        mcp_response = self.rpc("tools/call", {"name": "list_vaults", "arguments": {}},
+                                {"token": mcp_created["token"]})
+        self.assertEqual(mcp_response.status_code, 200, mcp_response.text)
+        self.assertIn(own, mcp_response.text)
+        listed = self.client.get("/api/v1/tokens", headers=ah).json()["tokens"]
+        self.assertIn(delegated["id"], [t["id"] for t in listed])
+        self.assertTrue(any(t["is_session"] for t in listed))
+        revoked = self.client.post(f"/api/v1/tokens/{delegated['id']}/revoke", headers=ah)
+        self.assertEqual(revoked.status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/vaults", headers=dh).status_code, 401)
+
     def test_admin_user_list_includes_owned_vaults_and_user_tokens(self):
         invite = self.client.post("/api/v1/admin/invites", headers=self.h(self.admin), json={"name": "signup"}).json()
         alice = self.register(invite["code"]).json()
@@ -95,6 +151,21 @@ class UserAccountTests(ServerCase):
 
 
 class UserAdminCliTests(unittest.TestCase):
+    def test_existing_account_tokens_become_sessions_on_upgrade(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            path = data_dir + "/obsi.db"
+            conn = sqlite3.connect(path)
+            for migration in MIGRATIONS[:-1]:
+                conn.executescript(migration)
+            conn.execute("PRAGMA user_version=4")
+            conn.execute("INSERT INTO users(id,username,password_hash,created_at) VALUES('u_old','alice','hash',1)")
+            conn.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id) VALUES('tok_old','user:alice','device','hash','{}',1,'u_old')")
+            conn.commit()
+            conn.close()
+            db = Database(path)
+            self.assertEqual(db.one("SELECT is_session FROM tokens WHERE id='tok_old'")["is_session"], 1)
+            db.close()
+
     def test_admin_cli_create_invite_and_list_commands(self):
         with tempfile.TemporaryDirectory() as data_dir:
             def run(*args):

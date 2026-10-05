@@ -28,6 +28,7 @@ class Token:
     revoked_at: int | None = None
     last_used_at: int | None = None
     user_id: str | None = None
+    is_session: bool = False
 
     def can(self, vault_id: str, op: str) -> bool:
         return op in self.grants.get(vault_id, ())
@@ -41,6 +42,7 @@ class Token:
             "created_at": self.created_at, "revoked_at": self.revoked_at,
             "last_used_at": self.last_used_at,
             "user_id": self.user_id,
+            "is_session": self.is_session,
         }
 
 
@@ -50,7 +52,7 @@ def hash_token(token: str) -> str:
 
 def _row(r) -> Token:
     return Token(r["id"], r["name"], r["kind"], json.loads(r["grants"]), r["created_at"],
-                 r["revoked_at"], r["last_used_at"], r["user_id"])
+                 r["revoked_at"], r["last_used_at"], r["user_id"], bool(r["is_session"]))
 
 
 class AuthService:
@@ -126,7 +128,7 @@ class AuthService:
         user = self.public_user(self.db.one("SELECT * FROM users WHERE id=?", (uid,)))
         plain = "obsi_" + secrets.token_urlsafe(32)
         tid = "tok_" + secrets.token_hex(6)
-        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id) VALUES(?,?,?,?,?,?,?)",
+        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id,is_session) VALUES(?,?,?,?,?,?,?,1)",
                         (tid, "user:" + norm, "device", hash_token(plain), "{}", ts, uid))
         return user, plain
 
@@ -138,7 +140,7 @@ class AuthService:
         user = self.public_user(row)
         plain = "obsi_" + secrets.token_urlsafe(32)
         tid, ts = "tok_" + secrets.token_hex(6), now_ms()
-        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id) VALUES(?,?,?,?,?,?,?)",
+        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id,is_session) VALUES(?,?,?,?,?,?,?,1)",
                         (tid, "user:" + norm, "device", hash_token(plain), "{}", ts, user["id"]))
         return user, plain
 
@@ -166,6 +168,32 @@ class AuthService:
             (tid, name, kind, hash_token(plain), json.dumps(grants), ts),
         )
         return Token(tid, name, kind, grants, ts), plain
+
+    def create_user_token(self, user_id: str, name: str, kind: str,
+                          grants: dict[str, list[str]] | None = None) -> tuple[Token, str]:
+        if kind not in ("device", "mcp"):
+            raise ApiError(422, "invalid_kind", "user tokens must be kind=device or kind=mcp")
+        clean = self.clean_grants(kind, grants)
+        plain = "obsi_" + secrets.token_urlsafe(32)
+        tid, ts = "tok_" + secrets.token_hex(6), now_ms()
+        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id) VALUES(?,?,?,?,?,?,?)",
+                        (tid, name, kind, hash_token(plain), json.dumps(clean), ts, user_id))
+        return Token(tid, name, kind, clean, ts, user_id=user_id), plain
+
+    def list_user(self, user_id: str) -> list[Token]:
+        return [_row(r) for r in self.db.query("SELECT * FROM tokens WHERE user_id=? ORDER BY created_at,id", (user_id,))]
+
+    def update_user(self, user_id: str, token_id: str, name=None, grants=None) -> Token:
+        tok = self.get(token_id)
+        if not tok or tok.user_id != user_id or tok.is_session:
+            raise ApiError(404, "not_found", "token not found")
+        return self.update(token_id, name, grants)
+
+    def revoke_user(self, user_id: str, token_id: str) -> Token:
+        tok = self.get(token_id)
+        if not tok or tok.user_id != user_id:
+            raise ApiError(404, "not_found", "token not found")
+        return self.revoke(token_id)
 
     def authenticate(self, plain: str | None) -> Token | None:
         """Returns the token if it exists and is not revoked; touches last_used_at."""

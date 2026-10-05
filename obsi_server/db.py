@@ -63,6 +63,10 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE ai_files ADD COLUMN backend TEXT NOT NULL DEFAULT 'local';
     """,
+    """
+    ALTER TABLE tokens ADD COLUMN is_session INTEGER NOT NULL DEFAULT 0;
+    UPDATE tokens SET is_session=1 WHERE user_id IS NOT NULL AND name LIKE 'user:%';
+    """,
 ]
 
 

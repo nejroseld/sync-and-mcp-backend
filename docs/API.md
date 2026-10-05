@@ -13,21 +13,26 @@
 `{"ok": true, "version": "0.1.0", "features": {"ai": true, "mcp": true, "rag": true}}`
 
 ### `GET /api/v1/me`
-`{"token_id": "...", "name": "laptop", "kind": "device", "grants": {"v_xxx": ["read","write"]}}`
+`{"token_id": "...", "name": "laptop", "kind": "device", "grants": {"v_xxx": ["read","write"]}, "account_token": false}`
 Пользовательские токены также возвращают `user: {id, username, created_at}`.
 
 ### Пользовательские аккаунты
 * `POST /api/v1/auth/register` `{"invite_code":"...","username":"alice","password":"..."}` → `{"token":"...","user":{"id":"u_...","username":"alice","created_at":...}}`. Код приглашения одноразовый; имя нормализуется (Unicode NFKC, пробелы по краям удаляются, регистр приводится к нижнему), пароль — минимум 12 символов.
-* `POST /api/v1/auth/login` `{"username":"alice","password":"..."}` → новый device-токен и объект пользователя.
-* `POST /api/v1/vaults` с пользовательским device-токеном `{"name":"Private"}` → создаёт vault, принадлежащий этому пользователю. Такой токен видит и изменяет свои vault'ы; доступ к чужим vault'ам возвращает 403. Существующие device/MCP гранты продолжают работать.
-* `GET /api/v1/vaults` для пользователя показывает его vault'ы и vault'ы, явно выданные через legacy-гранты.
+* `POST /api/v1/auth/login` `{"username":"alice","password":"..."}` → account session token и объект пользователя. `/api/v1/me` сообщает `account_token: true`.
+* `POST /api/v1/vaults` с account session token `{"name":"Private"}` → создаёт принадлежащий пользователю vault. Session token имеет implicit owner access.
+* `GET /api/v1/vaults` для account session показывает его vault'ы и vault'ы, явно выданные через grants.
+* `GET /api/v1/tokens` → список собственных токенов, включая account sessions.
+* `POST /api/v1/tokens` принимает `{"name":"Laptop","kind":"device"|"mcp","grants":{"v_xxx":["read","write"]}}` → токен, секрет которого показывается один раз. Grants разрешены только для принадлежащих пользователю vault'ов.
+* `PATCH /api/v1/tokens/{id}` принимает `{"name"?,"grants"?}` для собственного delegated token; `POST /api/v1/tokens/{id}/revoke` отзывает собственный токен.
+
+Delegated device/MCP tokens имеют только явные grants, не могут создавать vault'ы или управлять токенами. Существующие админские `/api/v1/admin/tokens` и их поведение сохранены.
 
 Admin управляет приглашениями (`kind=admin`): `POST /api/v1/admin/invites` `{"name":"signup"}` возвращает code единожды; `GET /api/v1/admin/invites` возвращает список без кодов.
 `GET /api/v1/admin/users` возвращает зарегистрированных пользователей и количества принадлежащих им vault'ов и пользовательских токенов: `{"users":[{"id":"u_...","username":"alice","created_at":1730000000000,"vault_count":1,"token_count":2}]}`. Доступен только admin-токен.
 
 ### `GET /api/v1/vaults`
 Vault'ы, на которые у токена есть хоть один грант (admin — все):
-`{"vaults": [{"id": "v_xxx", "name": "Personal", "created_at": 1730000000000, "rag": {"enabled": true}}]}`
+`{"vaults": [{"id": "v_xxx", "name": "Personal", "created_at": 1730000000000, "owner_user_id": "u_xxx", "rag": {"enabled": true}}]}`
 
 ## Admin (kind=admin)
 
