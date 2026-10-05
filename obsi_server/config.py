@@ -21,6 +21,11 @@ class Config:
     max_body_bytes: int = 200 * 1024 * 1024
     rag_worker: bool = True  # background embedding thread
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    s3_bucket: str | None = None
+    s3_region: str | None = None
+    s3_endpoint: str | None = None
+    s3_prefix: str = "obsi"
+    s3_threshold_mb: int = 10
 
     @property
     def features(self) -> dict[str, bool]:
@@ -52,6 +57,11 @@ class Config:
             if "max_body_mb" in s:
                 cfg.max_body_bytes = int(s["max_body_mb"]) * 1024 * 1024
             cfg.rag_worker = bool(s.get("rag_worker", cfg.rag_worker))
+            cfg.s3_bucket = s.get("s3_bucket", cfg.s3_bucket)
+            cfg.s3_region = s.get("s3_region", cfg.s3_region)
+            cfg.s3_endpoint = s.get("s3_endpoint", cfg.s3_endpoint)
+            cfg.s3_prefix = s.get("s3_prefix", cfg.s3_prefix)
+            cfg.s3_threshold_mb = int(s.get("s3_threshold_mb", cfg.s3_threshold_mb))
         if "OBSI_DATA_DIR" in env:
             cfg.data_dir = Path(env["OBSI_DATA_DIR"])
         cfg.host = env.get("OBSI_HOST", cfg.host)
@@ -64,4 +74,12 @@ class Config:
             cfg.rag_worker = env["OBSI_RAG_WORKER"].lower() not in ("0", "false", "no", "")
         if "OBSI_CORS_ORIGINS" in env:
             cfg.cors_origins = [o.strip() for o in env["OBSI_CORS_ORIGINS"].split(",") if o.strip()]
+        cfg.s3_bucket = env.get("OBSI_S3_BUCKET", cfg.s3_bucket)
+        cfg.s3_region = env.get("OBSI_S3_REGION", cfg.s3_region)
+        cfg.s3_endpoint = env.get("OBSI_S3_ENDPOINT", cfg.s3_endpoint)
+        cfg.s3_prefix = env.get("OBSI_S3_PREFIX", cfg.s3_prefix)
+        if "OBSI_S3_THRESHOLD_MB" in env:
+            cfg.s3_threshold_mb = int(env["OBSI_S3_THRESHOLD_MB"])
+        if cfg.s3_threshold_mb < 0:
+            raise ValueError("s3_threshold_mb must be non-negative")
         return cfg

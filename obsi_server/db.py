@@ -46,6 +46,23 @@ MIGRATIONS: list[str] = [
     CREATE INDEX chunks_vp ON chunks(vault_id, path);
     CREATE VIRTUAL TABLE chunks_fts USING fts5(text);
     """,
+    """
+    CREATE TABLE users(
+        id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL);
+    CREATE TABLE invites(
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, code_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, used_at INTEGER);
+    ALTER TABLE tokens ADD COLUMN user_id TEXT REFERENCES users(id);
+    ALTER TABLE vaults ADD COLUMN owner_user_id TEXT REFERENCES users(id);
+    CREATE INDEX vault_owner ON vaults(owner_user_id);
+    """,
+    """
+    ALTER TABLE blobs ADD COLUMN backend TEXT NOT NULL DEFAULT 'local';
+    """,
+    """
+    ALTER TABLE ai_files ADD COLUMN backend TEXT NOT NULL DEFAULT 'local';
+    """,
 ]
 
 

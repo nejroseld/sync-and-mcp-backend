@@ -4,7 +4,8 @@
 plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и строит поиск (FTS5 + эмбеддинги).
 Контракт описан в `docs/API.md`, архитектура в `docs/ARCHITECTURE.md`.
 
-Зависимости: Python 3.11+, `fastapi`, `uvicorn`, `httpx`. Всё остальное стандартная библиотека
+Зависимости: Python 3.11+, `fastapi`, `uvicorn`, `httpx`. Для S3 установите `pip install -e '.[s3]'`.
+Всё остальное стандартная библиотека
 (sqlite3 с FTS5). `numpy` необязателен: если установлен, косинус считается быстрее.
 
 ## Установка на Ubuntu VPS
@@ -144,10 +145,19 @@ python3 -m obsi_server --data-dir ./data serve --host 0.0.0.0 --port 8765
 | `OBSI_MAX_BODY_MB` | `200` | лимит тела запроса |
 | `OBSI_RAG_WORKER` | `1` | фоновый поток эмбеддингов |
 | `OBSI_CORS_ORIGINS` | `*` | список через запятую |
+| `OBSI_S3_BUCKET` | не задан | бакет для вложений больше порога; нужны учётные данные boto3 |
+| `OBSI_S3_THRESHOLD_MB` | `10` | порог выгрузки файлов, кроме `.md` |
+| `OBSI_S3_REGION` / `OBSI_S3_ENDPOINT` / `OBSI_S3_PREFIX` | не задан / не задан / `obsi` | параметры S3 |
 
 Пример TOML: `[server]\ndata_dir="/srv/obsi"\nfeatures=["ai","mcp"]\nmax_body_mb=500`.
 
 Сервер говорит по HTTP; для доступа из интернета ставьте за reverse proxy с TLS.
+Настройка S3 и поведение файлов описаны в [docs/S3.md](docs/S3.md).
+
+Для выдачи пользователю доступа администратор создаёт одноразовое приглашение в плагине
+или через `POST /api/v1/admin/invites`. Пользователь вводит код, логин и пароль в мастере
+подключения плагина и затем создаёт собственный vault. Старые device-токены и гранты
+продолжают действовать; подробности в [docs/API.md](docs/API.md).
 
 ## Быстрый старт
 

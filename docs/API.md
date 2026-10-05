@@ -14,6 +14,15 @@
 
 ### `GET /api/v1/me`
 `{"token_id": "...", "name": "laptop", "kind": "device", "grants": {"v_xxx": ["read","write"]}}`
+Пользовательские токены также возвращают `user: {id, username, created_at}`.
+
+### Пользовательские аккаунты
+* `POST /api/v1/auth/register` `{"invite_code":"...","username":"alice","password":"..."}` → `{"token":"...","user":{"id":"u_...","username":"alice","created_at":...}}`. Код приглашения одноразовый; имя нормализуется (Unicode NFKC, пробелы по краям удаляются, регистр приводится к нижнему), пароль — минимум 12 символов.
+* `POST /api/v1/auth/login` `{"username":"alice","password":"..."}` → новый device-токен и объект пользователя.
+* `POST /api/v1/vaults` с пользовательским device-токеном `{"name":"Private"}` → создаёт vault, принадлежащий этому пользователю. Такой токен видит и изменяет свои vault'ы; доступ к чужим vault'ам возвращает 403. Существующие device/MCP гранты продолжают работать.
+* `GET /api/v1/vaults` для пользователя показывает его vault'ы и vault'ы, явно выданные через legacy-гранты.
+
+Admin управляет приглашениями (`kind=admin`): `POST /api/v1/admin/invites` `{"name":"signup"}` возвращает code единожды; `GET /api/v1/admin/invites` возвращает список без кодов.
 
 ### `GET /api/v1/vaults`
 Vault'ы, на которые у токена есть хоть один грант (admin — все):
@@ -46,7 +55,10 @@ Vault'ы, на которые у токена есть хоть один гра�
   `ETag`, `X-Mtime-Cli`, `X-Ctime-Cli`, `X-Mtime-Svr`. 404 если нет.
 * `HEAD` — то же без тела (stat).
 * `PUT /api/v1/vaults/{vid}/files/{key:path}` (`write`) — тело = содержимое (для папки `key` с `/` на конце
-  и пустое тело). Заголовки `X-Mtime-Cli`, `X-Ctime-Cli` (ms). Ответ — объект файла как в листинге.
+  и пустое тело). Заголовки `X-Mtime-Cli`, `X-Ctime-Cli` (ms), а также необязательный
+  `X-Obsi-Markdown: true|false`: плагин передаёт тип исходного файла, поскольку имя зашифровано.
+  Файлы с `false` размером больше порога S3 хранятся в объектном хранилище; без заголовка
+  остаются локальными. Ответ — объект файла как в листинге.
 * `DELETE /api/v1/vaults/{vid}/files/{key:path}` (`write`) → `204`. Удаление отсутствующего — тоже 204.
 * Лимит размера тела настраивается (по умолчанию 200 MB).
 
@@ -62,6 +74,8 @@ Vault'ы, на которые у токена есть хоть один гра�
   Ответ — объект манифеста. Ставит файл в очередь индексации.
 * `DELETE /api/v1/vaults/{vid}/ai/files/{path:path}` → `204`; синхронно удаляет из индекса.
 * `POST /api/v1/vaults/{vid}/ai/clear` → удалить весь AI Available vault'а (выключение AI на клиенте).
+* Опубликованные вложения (любые файлы, кроме `.md`) размером больше порога S3 тоже
+  хранятся в объектном хранилище; манифест и MCP API не меняются.
 
 ## Pending changes (запись через MCP → клиент)
 
@@ -98,7 +112,8 @@ Streamable HTTP transport (MCP spec 2025-06-18; принимаем и `2025-03-2
 * `ETag` в ответах storage — hex sha256 без кавычек (как `etag` в листинге).
 * Admin-токен не имеет доступа к данным: sync/AI/changes endpoints требуют `kind=device` (403 иначе);
   `/mcp` требует `kind=mcp` (403 иначе, 401 без токена).
-* Дополнительные коды: `413 payload_too_large` (лимит тела), `404 feature_disabled`
+* Дополнительные коды: `413 payload_too_large` (лимит тела), `503 s3_unavailable` (S3 не настроен
+  для крупного вложения или отсутствует драйвер), `404 feature_disabled`
   (модуль выключен), `405` на `GET /mcp`.
 * `stale_publish` (409) возвращает в `error` ещё `current_version` и `current_mtime`. PUT с тем же
   `version` не меняет данные (mtime обновляется, только если больше).

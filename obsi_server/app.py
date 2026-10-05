@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -43,11 +43,11 @@ class Context:
 def build_context(config: Config, embed_fn: EmbedFn = http_embed) -> Context:
     config.data_dir.mkdir(parents=True, exist_ok=True)
     db = Database(config.data_dir / "obsi.db")
-    vaults, ai, changes = VaultService(db), AiStore(db), ChangeQueue(db)
-    auth, storage = AuthService(db), Storage(db, config.data_dir)
+    vaults, changes = VaultService(db), ChangeQueue(db)
+    auth, storage = AuthService(db), Storage(db, config.data_dir, config)
+    ai = AiStore(db, storage)
     rag = RagService(db, vaults, ai, embed_fn)
-    vaults.on_delete += [storage.purge, changes.purge, auth.drop_vault,
-                         lambda vid: db.execute("DELETE FROM ai_files WHERE vault_id=?", (vid,))]
+    vaults.on_delete += [storage.purge, changes.purge, auth.drop_vault, ai.clear]
     if config.features["rag"]:
         rag.attach()
     return Context(config, db, auth, vaults, storage, ai, changes, rag, McpServer(config, vaults, ai, changes, rag))
@@ -77,9 +77,12 @@ def auth(*kinds: str):
 
 
 def vault_access(ctx: Context, tok: Token, vid: str, op: str) -> None:
-    if not tok.can(vid, op):
+    vault = ctx.vaults.get(vid)
+    if not vault:
+        ctx.vaults.require(vid)
+    owner_access = tok.kind == "device" and tok.user_id is not None and vault["owner_user_id"] == tok.user_id
+    if not owner_access and not tok.can(vid, op):
         raise ApiError(403, "forbidden", f"no '{op}' grant on this vault")
-    ctx.vaults.require(vid)
 
 
 def feature(name: str):
@@ -114,6 +117,17 @@ def _int_header(request: Request, name: str) -> int | None:
 # ---- request models ------------------------------------------------------------------
 class VaultIn(BaseModel):
     name: str
+
+
+class RegisterIn(BaseModel):
+    invite_code: str
+    username: str
+    password: str
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
 
 
 class RagIn(BaseModel):
@@ -167,20 +181,59 @@ def core_router() -> APIRouter:
         return {"ok": True, "version": __version__, "features": get_ctx(request).config.features}
 
     @r.get("/me")
-    def me(tok: Token = Depends(auth())):
-        return {"token_id": tok.id, "name": tok.name, "kind": tok.kind, "grants": tok.grants}
+    def me(request: Request, tok: Token = Depends(auth())):
+        user_row = get_ctx(request).db.one("SELECT * FROM users WHERE id=?", (tok.user_id,)) if tok.user_id else None
+        return {"token_id": tok.id, "name": tok.name, "kind": tok.kind, "grants": tok.grants,
+                **({"user": AuthService.public_user(user_row)} if user_row else {})}
 
     @r.get("/vaults")
     def vaults(request: Request, tok: Token = Depends(auth())):
         ctx = get_ctx(request)
-        only = None if tok.kind == "admin" else {v for v in tok.grants if tok.has_any(v)}
+        if tok.kind == "admin":
+            visible = ctx.vaults.list()
+        else:
+            ids = {v for v in tok.grants if tok.has_any(v)}
+            visible = ctx.vaults.list(ids)
+            if tok.user_id:
+                owned = ctx.vaults.list_owned(tok.user_id)
+                known = {v["id"] for v in visible}
+                visible.extend(v for v in owned if v["id"] not in known)
         return {"vaults": [{"id": v["id"], "name": v["name"], "created_at": v["created_at"],
-                            "rag": {"enabled": v["rag"]["enabled"]}} for v in ctx.vaults.list(only)]}
+                            "rag": {"enabled": v["rag"]["enabled"]}} for v in visible]}
+
+    @r.post("/vaults")
+    def create_user_vault(body: VaultIn, request: Request, tok: Token = Depends(auth("device"))):
+        if not tok.user_id:
+            raise ApiError(403, "user_account_required", "a registered user device token is required")
+        return get_ctx(request).vaults.create(body.name, owner_user_id=tok.user_id)
+    return r
+
+
+def user_auth_router() -> APIRouter:
+    r = APIRouter(prefix="/auth")
+
+    @r.post("/register")
+    def register(body: RegisterIn, request: Request):
+        user, token = get_ctx(request).auth.register(body.invite_code, body.username, body.password)
+        return {"token": token, "user": user}
+
+    @r.post("/login")
+    def login(body: LoginIn, request: Request):
+        user, token = get_ctx(request).auth.login(body.username, body.password)
+        return {"token": token, "user": user}
     return r
 
 
 def admin_router() -> APIRouter:
     r = APIRouter(prefix="/admin", dependencies=[Depends(auth("admin"))])
+
+    @r.post("/invites")
+    def create_invite(body: VaultIn, request: Request):
+        return get_ctx(request).auth.create_invite(body.name)
+
+    @r.get("/invites")
+    def list_invites(request: Request):
+        return {"invites": get_ctx(request).auth.list_invites()}
 
     @r.post("/vaults")
     def create_vault(body: VaultIn, request: Request):
@@ -270,10 +323,13 @@ def storage_router() -> APIRouter:
     def get_file(vid: str, key: str, request: Request):
         ctx = _access(request, vid, "read")
         o = ctx.storage.stat(vid, key)
-        p = ctx.storage.blob_path(vid, key)
-        if not o or not p.exists():
+        if not o:
             raise ApiError(404, "not_found", "file not found")
-        return FileResponse(p, media_type="application/octet-stream", headers=_headers(o))
+        try:
+            data = ctx.storage.read(vid, key)
+        except FileNotFoundError:
+            raise ApiError(404, "not_found", "file not found") from None
+        return Response(content=data, media_type="application/octet-stream", headers=_headers(o))
 
     @r.head("/{key:path}")
     def head_file(vid: str, key: str, request: Request):
@@ -287,8 +343,12 @@ def storage_router() -> APIRouter:
     async def put_file(vid: str, key: str, request: Request):
         ctx = _access(request, vid, "write")
         data = await read_body(request, ctx.config.max_body_bytes)
+        markdown_header = request.headers.get("x-obsi-markdown")
+        if markdown_header is not None and markdown_header not in ("true", "false"):
+            raise ApiError(422, "validation_error", "X-Obsi-Markdown must be true or false")
+        is_markdown = None if markdown_header is None else markdown_header == "true"
         return await run_in_threadpool(ctx.storage.put, vid, key, data, _int_header(request, "x-mtime-cli"),
-                                       _int_header(request, "x-ctime-cli"))
+                                       _int_header(request, "x-ctime-cli"), is_markdown)
 
     @r.delete("/{key:path}", status_code=204)
     def delete_file(vid: str, key: str, request: Request):
@@ -353,7 +413,7 @@ def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> 
     app.state.ctx = ctx
     app.add_middleware(CORSMiddleware, allow_origins=config.cors_origins,
                        allow_methods=["GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"],
-                       allow_headers=["Authorization", "Content-Type", "X-*", "x-mtime", "x-mtime-cli", "x-ctime-cli"],
+                       allow_headers=["Authorization", "Content-Type", "X-*", "x-mtime", "x-mtime-cli", "x-ctime-cli", "x-obsi-markdown"],
                        expose_headers=["ETag", "X-Mtime-Cli", "X-Ctime-Cli", "X-Mtime-Svr"])
 
     def err_json(status: int, code: str, message: str, extra: dict | None = None, headers: dict | None = None):
@@ -375,7 +435,7 @@ def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> 
         return err_json(e.status_code, code, str(e.detail))
 
     api = APIRouter(prefix="/api/v1")
-    for rt in (core_router(), admin_router(), storage_router(), ai_router()):
+    for rt in (core_router(), user_auth_router(), admin_router(), storage_router(), ai_router()):
         api.include_router(rt)
     app.include_router(api)
 

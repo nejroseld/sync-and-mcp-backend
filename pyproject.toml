@@ -11,6 +11,7 @@ dependencies = ["fastapi", "uvicorn", "httpx"]
 
 [project.optional-dependencies]
 fast = ["numpy"]
+s3 = ["boto3"]
 
 [project.scripts]
 obsi-server = "obsi_server.cli:main"

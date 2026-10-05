@@ -14,6 +14,7 @@ def _public(r) -> dict:
         "id": r["id"], "name": r["name"], "created_at": r["created_at"],
         "rag": {"enabled": bool(r["rag_enabled"]), "chunk_chars": r["chunk_chars"],
                 "chunk_overlap": r["chunk_overlap"]},
+        "owner_user_id": r["owner_user_id"],
     }
 
 
@@ -23,9 +24,10 @@ class VaultService:
         self.on_delete: list[Callable[[str], None]] = []
         self.on_rag_settings_changed: list[Callable[[str], None]] = []
 
-    def create(self, name: str) -> dict:
+    def create(self, name: str, owner_user_id: str | None = None) -> dict:
         vid = "v_" + base64.b32encode(secrets.token_bytes(10)).decode().lower()
-        self.db.execute("INSERT INTO vaults(id,name,created_at) VALUES(?,?,?)", (vid, name, now_ms()))
+        self.db.execute("INSERT INTO vaults(id,name,created_at,owner_user_id) VALUES(?,?,?,?)",
+                        (vid, name, now_ms(), owner_user_id))
         return self.get(vid)  # type: ignore[return-value]
 
     def get(self, vid: str) -> dict | None:
@@ -41,6 +43,10 @@ class VaultService:
     def list(self, only: set[str] | None = None) -> list[dict]:
         rows = self.db.query("SELECT * FROM vaults ORDER BY created_at, id")
         return [_public(r) for r in rows if only is None or r["id"] in only]
+
+    def list_owned(self, user_id: str) -> list[dict]:
+        return [_public(r) for r in self.db.query(
+            "SELECT * FROM vaults WHERE owner_user_id=? ORDER BY created_at,id", (user_id,))]
 
     def update(self, vid: str, name: str | None = None, rag: dict | None = None) -> dict:
         v = self.require(vid)

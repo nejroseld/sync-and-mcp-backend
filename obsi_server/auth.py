@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import unicodedata
 from dataclasses import dataclass, field
 
 from .db import Database, now_ms
@@ -26,6 +27,7 @@ class Token:
     created_at: int
     revoked_at: int | None = None
     last_used_at: int | None = None
+    user_id: str | None = None
 
     def can(self, vault_id: str, op: str) -> bool:
         return op in self.grants.get(vault_id, ())
@@ -38,6 +40,7 @@ class Token:
             "id": self.id, "name": self.name, "kind": self.kind, "grants": self.grants,
             "created_at": self.created_at, "revoked_at": self.revoked_at,
             "last_used_at": self.last_used_at,
+            "user_id": self.user_id,
         }
 
 
@@ -47,12 +50,87 @@ def hash_token(token: str) -> str:
 
 def _row(r) -> Token:
     return Token(r["id"], r["name"], r["kind"], json.loads(r["grants"]), r["created_at"],
-                 r["revoked_at"], r["last_used_at"])
+                 r["revoked_at"], r["last_used_at"], r["user_id"])
 
 
 class AuthService:
     def __init__(self, db: Database):
         self.db = db
+
+    @staticmethod
+    def normalize_username(username: str) -> str:
+        return unicodedata.normalize("NFKC", username).strip().casefold()
+
+    @staticmethod
+    def _password_hash(password: str) -> str:
+        salt = secrets.token_bytes(16)
+        digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+        return "scrypt$16384$8$1$" + salt.hex() + "$" + digest.hex()
+
+    @staticmethod
+    def _verify_password(password: str, encoded: str) -> bool:
+        try:
+            scheme, n, r, p, salt, expected = encoded.split("$")
+            if scheme != "scrypt":
+                return False
+            actual = hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt),
+                                    n=int(n), r=int(r), p=int(p))
+            return secrets.compare_digest(actual.hex(), expected)
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def public_user(row) -> dict:
+        return {"id": row["id"], "username": row["username"], "created_at": row["created_at"]}
+
+    def create_invite(self, name: str) -> dict:
+        code = "inv_" + secrets.token_urlsafe(32)
+        invite_id, ts = "i_" + secrets.token_hex(8), now_ms()
+        self.db.execute("INSERT INTO invites(id,name,code_hash,created_at) VALUES(?,?,?,?)",
+                        (invite_id, name.strip(), hash_token(code), ts))
+        return {"id": invite_id, "name": name.strip(), "code": code, "created_at": ts, "used_at": None}
+
+    def list_invites(self) -> list[dict]:
+        return [dict(r) for r in self.db.query("SELECT id,name,created_at,used_at FROM invites ORDER BY created_at,id")]
+
+    def register(self, invite_code: str, username: str, password: str) -> tuple[dict, str]:
+        norm = self.normalize_username(username)
+        if len(norm) < 3 or len(norm) > 64 or any(ord(c) < 32 for c in norm):
+            raise ApiError(422, "invalid_username", "username must be 3 to 64 characters")
+        if len(password) < 12 or len(password) > 1024:
+            raise ApiError(422, "weak_password", "password must be at least 12 characters")
+        uid, ts = "u_" + secrets.token_hex(12), now_ms()
+        try:
+            with self.db.transaction():
+                invite = self.db.one("SELECT * FROM invites WHERE code_hash=? AND used_at IS NULL",
+                                     (hash_token(invite_code),))
+                if not invite:
+                    raise ApiError(401, "invalid_invite", "invite code is invalid or already used")
+                self.db.execute("INSERT INTO users(id,username,password_hash,created_at) VALUES(?,?,?,?)",
+                                (uid, norm, self._password_hash(password), ts))
+                self.db.execute("UPDATE invites SET used_at=? WHERE id=? AND used_at IS NULL", (ts, invite["id"]))
+        except Exception as e:
+            if "UNIQUE constraint failed: users.username" in str(e):
+                raise ApiError(409, "username_taken", "username is already registered") from e
+            raise
+        user = self.public_user(self.db.one("SELECT * FROM users WHERE id=?", (uid,)))
+        plain = "obsi_" + secrets.token_urlsafe(32)
+        tid = "tok_" + secrets.token_hex(6)
+        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id) VALUES(?,?,?,?,?,?,?)",
+                        (tid, "user:" + norm, "device", hash_token(plain), "{}", ts, uid))
+        return user, plain
+
+    def login(self, username: str, password: str) -> tuple[dict, str]:
+        norm = self.normalize_username(username)
+        row = self.db.one("SELECT * FROM users WHERE username=?", (norm,))
+        if not row or not self._verify_password(password, row["password_hash"]):
+            raise ApiError(401, "invalid_credentials", "username or password is incorrect")
+        user = self.public_user(row)
+        plain = "obsi_" + secrets.token_urlsafe(32)
+        tid, ts = "tok_" + secrets.token_hex(6), now_ms()
+        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id) VALUES(?,?,?,?,?,?,?)",
+                        (tid, "user:" + norm, "device", hash_token(plain), "{}", ts, user["id"]))
+        return user, plain
 
     def clean_grants(self, kind: str, grants: dict[str, list[str]] | None) -> dict[str, list[str]]:
         if kind not in ALLOWED_OPS:
