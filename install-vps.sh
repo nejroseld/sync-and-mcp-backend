@@ -31,7 +31,7 @@ if [[ ! $PORT =~ ^[0-9]+$ ]] || (( 10#$PORT < 1 || 10#$PORT > 65535 )); then
 fi
 PORT=$((10#$PORT))
 command -v systemctl >/dev/null || die 'systemd is required'
-[[ $S3_MODE == auto || $S3_MODE == configure ]] || die 'OBSI_S3_MODE must be auto or configure'
+[[ $S3_MODE == auto || $S3_MODE == configure || $S3_MODE == skip ]] || die 'OBSI_S3_MODE must be auto, configure or skip'
 
 prompt_s3() {
   local bucket region endpoint prefix threshold access_key secret_key tmp
@@ -76,7 +76,7 @@ prompt_s3() {
 
 if [[ $S3_MODE == configure ]]; then
   prompt_s3
-elif [[ ! -f $S3_ENV_FILE && -r /dev/tty ]]; then
+elif [[ $S3_MODE == auto && ! -f $S3_ENV_FILE && -r /dev/tty ]]; then
   answer=
   read -r -p 'Configure optional S3 attachment storage? [y/N]: ' answer </dev/tty || true
   if [[ $answer == y || $answer == Y ]]; then prompt_s3; fi
