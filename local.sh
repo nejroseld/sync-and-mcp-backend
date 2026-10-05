@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Local one-click run: venv + deps, first-run bootstrap (vault + tokens -> data/TOKENS.txt), serve.
 # Overrides: OBSI_HOST (127.0.0.1), OBSI_PORT (8766), OBSI_DATA_DIR (./data), PYTHON (python3).
+# Optional S3: set OBSI_S3_BUCKET (or s3_bucket in OBSI_CONFIG); boto3 is installed only then.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -10,11 +11,20 @@ DATA="${OBSI_DATA_DIR:-$PWD/data}"
 PY="${PYTHON:-python3}"
 unset OBSI_DATA_DIR OBSI_HOST OBSI_PORT  # the CLI flags below are the single source of truth
 
+NEW_VENV=0
 if [ ! -x .venv/bin/obsi-server ]; then
   echo "==> Creating venv and installing dependencies"
   "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || { echo "Python 3.11+ required"; exit 1; }
   "$PY" -m venv .venv
   .venv/bin/pip install -q --upgrade pip
+  NEW_VENV=1
+fi
+S3_BUCKET=$(.venv/bin/python -c 'from obsi_server.config import Config; print(Config.load().s3_bucket or "")')
+if [ -n "$S3_BUCKET" ]; then
+  if [ "$NEW_VENV" -eq 1 ] || ! .venv/bin/python -c 'import boto3' 2>/dev/null; then
+    .venv/bin/pip install -q -e '.[s3]'
+  fi
+elif [ "$NEW_VENV" -eq 1 ]; then
   .venv/bin/pip install -q -e .
 fi
 obsi() { .venv/bin/obsi-server --data-dir "$DATA" "$@"; }

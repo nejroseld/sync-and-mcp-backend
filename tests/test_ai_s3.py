@@ -25,6 +25,18 @@ class FakeS3:
 
 
 class AiS3Tests(unittest.TestCase):
+    def test_large_attachment_stays_local_without_s3(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Database(Path(d) / "obsi.db")
+            try:
+                cfg = Config(data_dir=Path(d), s3_threshold_mb=0)
+                ai = AiStore(db, Storage(db, cfg.data_dir, cfg))
+                ai.put("v_one", "image.png", b"image", 1)
+                row = db.one("SELECT backend,content FROM ai_files WHERE vault_id=?", ("v_one",))
+                self.assertEqual((row["backend"], bytes(row["content"])), ("local", b"image"))
+            finally:
+                db.close()
+
     def test_attachment_offload_read_overwrite_and_clear(self):
         with tempfile.TemporaryDirectory() as d:
             db = Database(Path(d) / "obsi.db")

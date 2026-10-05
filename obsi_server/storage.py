@@ -93,9 +93,7 @@ class Storage:
         # Keys are encrypted by the plugin, so an omitted type hint is ambiguous.
         # Keep ambiguous objects local; clients that know the plaintext extension
         # send an explicit false for attachments.
-        offload = is_markdown is False and len(data) > threshold
-        if offload and not bucket:
-            raise ApiError(503, "s3_unavailable", "S3 offload requires OBSI_S3_BUCKET")
+        offload = bool(bucket) and is_markdown is False and len(data) > threshold
         d = self._dir(vid)
         d.mkdir(parents=True, exist_ok=True)
         target = self.blob_path(vid, key)

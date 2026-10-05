@@ -87,7 +87,7 @@ class AiStore:
         mtime = now_ms() if mtime is None else mtime
         version = hashlib.sha256(data).hexdigest()
         threshold = int(getattr(getattr(self.storage, "config", None), "s3_threshold_mb", 10)) * 1024 * 1024
-        offload = ext(path) != ".md" and len(data) > threshold
+        offload = bool(getattr(getattr(self.storage, "config", None), "s3_bucket", None)) and ext(path) != ".md" and len(data) > threshold
         with self.db.transaction():
             old = self.db.one("SELECT version,mtime,backend FROM ai_files WHERE vault_id=? AND path=?", (vid, path))
             if old and old["version"] != version and mtime < old["mtime"]:

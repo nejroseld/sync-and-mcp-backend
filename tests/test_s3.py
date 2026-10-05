@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 from obsi_server.config import Config
 from obsi_server.db import Database
-from obsi_server.errors import ApiError
 from obsi_server.storage import Storage
 
 
@@ -63,13 +62,12 @@ class S3StorageTests(unittest.TestCase):
         self.storage.delete("v", "opaque")
         self.assertNotIn(("bucket", remote_key), self.s3.objects)
 
-    def test_offload_without_bucket_fails_before_local_write(self):
+    def test_without_bucket_large_attachment_stays_local(self):
         cfg = SimpleNamespace(s3_bucket=None, s3_threshold_mb=0)
         storage = Storage(self.db, Path(self.tmp.name), cfg, s3_client=self.s3)
-        with self.assertRaises(ApiError) as error:
-            storage.put("v", "opaque", b"large", None, None, is_markdown=False)
-        self.assertEqual((error.exception.status, error.exception.code), (503, "s3_unavailable"))
-        self.assertIsNone(storage.stat("v", "opaque"))
+        storage.put("v", "opaque", b"large", None, None, is_markdown=False)
+        self.assertEqual(storage.stat("v", "opaque")["size"], 5)
+        self.assertEqual(self.db.one("SELECT backend FROM blobs WHERE key='opaque'")["backend"], "local")
 
 
 if __name__ == "__main__":

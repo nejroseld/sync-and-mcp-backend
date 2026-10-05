@@ -78,6 +78,8 @@ remote() { ssh "${SSH_ARGS[@]}" "$SSH_USER@$SSH_HOST" "$@"; }
 remote_tty() { ssh -tt "${SSH_ARGS[@]}" "$SSH_USER@$SSH_HOST" "$@"; }
 
 deploy() {
+  local s3_mode=${1:-auto}
+  [[ $s3_mode == auto || $s3_mode == configure ]] || fail 'Неверный режим S3' || return 1
   check_config || return 1
   command -v tar >/dev/null && command -v scp >/dev/null || fail 'Нужны tar и scp' || return 1
   [[ -f $SOURCE_DIR/install-vps.sh && -f $SOURCE_DIR/pyproject.toml ]] || fail 'Запустите скрипт из репозитория сервера' || return 1
@@ -94,7 +96,7 @@ deploy() {
   fi
   scp "${SCP_ARGS[@]}" "$archive" "$SSH_USER@$SSH_HOST:$remote_dir/source.tar.gz" || result=1
   if (( result == 0 )); then remote "tar -xzf '$remote_dir/source.tar.gz' -C '$remote_dir'" || result=1; fi
-  if (( result == 0 )); then remote_tty "sudo env OBSI_PORT=$APP_PORT bash '$remote_dir/install-vps.sh'" || result=1; fi
+  if (( result == 0 )); then remote_tty "sudo env OBSI_PORT=$APP_PORT OBSI_S3_MODE=$s3_mode bash '$remote_dir/install-vps.sh'" || result=1; fi
   remote "rm -rf -- '$remote_dir'" || true
   rm -rf "$tmp"
   return "$result"
@@ -156,7 +158,7 @@ enable_key_auth() {
 load_config
 while true; do
   printf '\nobsi-mcp VPS: %s@%s (SSH %s, MCP %s)\n' "$SSH_USER" "$SSH_HOST" "$SSH_PORT" "$APP_PORT"
-  printf '%s\n' '1) Настроить подключение' '2) Установить / обновить сервер' '3) Статус сервиса' '4) Последние логи' '5) Показать токены' '6) Создать SSH-ключ / отключить вход по паролю' '0) Выход'
+  printf '%s\n' '1) Настроить подключение' '2) Установить / обновить сервер' '3) Статус сервиса' '4) Последние логи' '5) Показать токены' '6) Создать SSH-ключ / отключить вход по паролю' '7) Настроить S3 на VPS' '0) Выход'
   read -r -p '> ' choice || break
   case $choice in
     1) configure || true ;;
@@ -170,6 +172,7 @@ while true; do
     4) if check_config; then ssh_args; remote_tty 'sudo journalctl -u obsi-mcp.service -n 80 --no-pager' || true; fi ;;
     5) if check_config; then ssh_args; remote_tty 'sudo cat /var/lib/obsi-mcp/TOKENS.txt' || true; fi ;;
     6) enable_key_auth || true ;;
+    7) deploy configure || true ;;
     0) break ;;
     *) echo 'Неизвестный пункт' ;;
   esac
