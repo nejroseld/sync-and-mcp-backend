@@ -255,7 +255,7 @@ parse_address() {
 
 build_ssh_opts() {
   SSH_OPTS=(-p "$SSH_PORT" -o "ControlPath=$CONTROL" -o ConnectTimeout=10
-            -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o LogLevel=ERROR)
+            -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o LogLevel=ERROR)
   if [[ -n $KEY_PATH && -f $KEY_PATH ]]; then SSH_OPTS+=(-i "$KEY_PATH" -o IdentitiesOnly=yes); fi
 }
 
@@ -304,12 +304,35 @@ handle_host_key_mismatch() {
   ssh-keygen -R "$name" >/dev/null 2>&1
 }
 
+# An unknown server: show its key fingerprints and save them only after the user confirms,
+# so the first password never goes to an impostor.
+verify_new_host_key() {
+  local name keys fps fp
+  name=$(host_key_name)
+  ssh-keygen -F "$name" >/dev/null 2>&1 && return 0
+  keys=$(ssh-keyscan -p "$SSH_PORT" -T 10 "$SSH_HOST" 2>/dev/null | grep -v '^#')
+  [[ -n $keys ]] || { bad "$(m hostkey_scan_failed "$SSH_HOST")"; return 1; }
+  fps=$(printf '%s\n' "$keys" | ssh-keygen -lf - 2>/dev/null)
+  [[ -n $fps ]] || { bad "$(m hostkey_scan_failed "$SSH_HOST")"; return 1; }
+  printf '\n'
+  say "$(m hostkey_new "$B$name$R")"
+  while read -r fp; do say "    $B$fp$R"; done <<< "$(printf '%s\n' "$fps" | awk '{print $2, $NF}')"
+  note "$(m hostkey_compare)"
+  if ! confirm "$(m hostkey_trust)" n; then
+    bad "$(m hostkey_rejected)"
+    return 1
+  fi
+  mkdir -p "$HOME/.ssh" && chmod 0700 "$HOME/.ssh" || return 1
+  printf '%s\n' "$keys" >> "$HOME/.ssh/known_hosts" || return 1
+}
+
 # Opens one shared SSH connection for the whole session, so a password is typed at most once.
 connect() {
   local key retried=0 rc target="$SSH_USER@$SSH_HOST"
   close_master
   build_ssh_opts
   while true; do
+    verify_new_host_key || return 1
     if SPIN_SILENT=1 spin "$(m connecting "$target")" open_master -o BatchMode=yes; then
       AUTH=key
       break
@@ -387,11 +410,19 @@ key_login_works() { # KEY (may be empty: default keys / agent)
 }
 
 setup_key() {
-  local key=${KEY_PATH:-$DEFAULT_KEY}
+  local key=${KEY_PATH:-$DEFAULT_KEY} comment
   if [[ ! -f $key ]]; then
     mkdir -p "$(dirname "$key")" && chmod 0700 "$(dirname "$key")" || return 1
-    ssh-keygen -q -t ed25519 -N '' -C "obsi-mcp@$(hostname 2>/dev/null || echo pc)" -f "$key" </dev/null || return 1
+    comment="obsi-mcp@$(hostname 2>/dev/null || echo pc)"
+    # Batch-mode SSH can use an encrypted key only through ssh-agent, so offer it only then.
+    if [[ -n ${SSH_AUTH_SOCK:-} ]] && confirm "$(m key_passphrase)" n; then
+      ssh-keygen -q -t ed25519 -C "$comment" -f "$key" || return 1  # asks for the passphrase itself
+      ssh-add "$key" || { bad "$(m key_agent_failed)"; return 1; }
+    else
+      ssh-keygen -q -t ed25519 -N '' -C "$comment" -f "$key" </dev/null || return 1
+    fi
   fi
+  chmod 0600 "$key" || return 1
   [[ -f $key.pub ]] || { bad "$(m no_pubkey "$key.pub")"; return 1; }
   # Expansion happens on the VPS.
   # shellcheck disable=SC2016
@@ -430,7 +461,7 @@ upload_code() {
   local dir
   # shellcheck disable=SC2016
   dir=$(COPYFILE_DISABLE=1 tar -czf - -C "$SOURCE_DIR" --exclude=__pycache__ --exclude='*.pyc' --exclude=i18n \
-          pyproject.toml obsi_server install-vps.sh scripts \
+          pyproject.toml requirements.lock requirements-s3.lock obsi_server install-vps.sh scripts \
         | remote_in 'd=$(mktemp -d /tmp/obsi-mcp.XXXXXXXX) && tar -xzf - -C "$d" && printf "%s" "$d"') || return 1
   valid_remote_dir "$dir" || { echo "Unexpected remote dir: $dir"; return 1; }
   printf '%s' "$dir" > "$WORK/remote_dir"
@@ -588,8 +619,13 @@ show_credentials() {
   fi
 
   block "$(m cred_admin)"
-  line "$admin"
   dim "$(m cred_admin_note)"
+  if [[ -n $admin ]] && confirm "$(m cred_admin_show)" n; then
+    line "$admin"
+  else
+    dim "$(m cred_admin_hidden)"
+  fi
+  admin=
 
   block "$(m cred_more)"
   line "$(m cred_more_1)"
@@ -614,11 +650,11 @@ server_admin() { # fixed CLI subcommand; optional validated invitation name
 }
 
 # Turns a JSON list (or object) on stdin into tab-separated FIELDS, one row per item.
-# Used invitations are skipped; *_at timestamps become dates.
+# Used, revoked and expired invitations are skipped; *_at timestamps become dates.
 JSON_ROWS='import json,sys,time
 d=json.load(sys.stdin)
 for r in d if isinstance(d,list) else [d]:
-    if not r.get("used_at"):
+    if not r.get("used_at") and r.get("status", "active") == "active":
         print("\t".join(time.strftime("%Y-%m-%d",time.localtime(r[k]/1000)) if k.endswith("_at") else str(r[k]) for k in sys.argv[1:]))'
 
 admin_rows() { # SUBCOMMAND FIELD...
@@ -909,7 +945,7 @@ load_strings "$(detect_lang)"
 [[ -n $LANG_WARNING ]] && UI_LANG='' && warn "$(m unknown_lang "$LANG_WARNING")"
 
 missing=
-for tool in ssh ssh-keygen tar; do command -v "$tool" >/dev/null || missing="$missing $tool"; done
+for tool in ssh ssh-keygen ssh-keyscan tar; do command -v "$tool" >/dev/null || missing="$missing $tool"; done
 if [[ -n $missing ]]; then
   bad "$(m missing_tools "$missing")"
   note "$(m missing_tools_hint)"

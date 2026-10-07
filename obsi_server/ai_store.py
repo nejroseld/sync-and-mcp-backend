@@ -8,6 +8,7 @@ from typing import Callable
 from .db import Database, now_ms
 from .errors import ApiError
 from .storage import Storage
+from .uploads import KeyedLock
 
 TEXT_EXT = {".md", ".txt", ".csv"}
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -45,6 +46,7 @@ class AiStore:
         self.on_put: list[Callable[[str, dict, bytes], None]] = []
         self.on_delete: list[Callable[[str, str], None]] = []
         self.on_clear: list[Callable[[str], None]] = []
+        self._lock = KeyedLock()
 
     def manifest(self, vid: str, prefix: str = "", limit: int | None = None, offset: int = 0) -> list[dict]:
         sql = ("SELECT path,version,mtime,size,kind FROM ai_files WHERE vault_id=? "
@@ -84,23 +86,36 @@ class AiStore:
 
     def put(self, vid: str, path: str, data: bytes, mtime: int | None) -> dict:
         path = norm_path(path)
+        with self._lock((vid, path)):
+            meta = self._put_locked(vid, path, data, mtime)
+            if meta is None:
+                return self.meta(vid, path)  # type: ignore[return-value]
+            for cb in self.on_put:
+                cb(vid, meta, data)
+            return meta
+
+    def _put_locked(self, vid: str, path: str, data: bytes, mtime: int | None) -> dict | None:
+        """Returns the new meta, or None when the content is unchanged."""
         mtime = now_ms() if mtime is None else mtime
         version = hashlib.sha256(data).hexdigest()
-        threshold = int(getattr(getattr(self.storage, "config", None), "s3_threshold_mb", 10)) * 1024 * 1024
-        offload = bool(getattr(getattr(self.storage, "config", None), "s3_bucket", None)) and ext(path) != ".md" and len(data) > threshold
+        config = getattr(self.storage, "config", None)
+        threshold = int(getattr(config, "s3_threshold_mb", 10)) * 1024 * 1024
+        offload = bool(getattr(config, "s3_bucket", None)) and ext(path) != ".md" and len(data) > threshold
+        old = self.db.one("SELECT version,mtime,backend,size FROM ai_files WHERE vault_id=? AND path=?", (vid, path))
+        if old and old["version"] != version and mtime < old["mtime"]:
+            raise ApiError(409, "stale_publish", "stored version is newer than the published one",
+                           {"current_version": old["version"], "current_mtime": old["mtime"]})
+        if old and old["version"] == version:
+            if mtime > old["mtime"]:
+                self.db.execute("UPDATE ai_files SET mtime=? WHERE vault_id=? AND path=?", (mtime, vid, path))
+            return None
+        if self.storage is not None:
+            self.storage.ensure_quota(vid, len(data), old["size"] if old else 0)
+        if offload:
+            if self.storage is None:
+                raise RuntimeError("S3 offload is required but storage is unavailable")
+            self.storage.s3_put_object(self._s3_key(vid, path, version), data)
         with self.db.transaction():
-            old = self.db.one("SELECT version,mtime,backend FROM ai_files WHERE vault_id=? AND path=?", (vid, path))
-            if old and old["version"] != version and mtime < old["mtime"]:
-                raise ApiError(409, "stale_publish", "stored version is newer than the published one",
-                               {"current_version": old["version"], "current_mtime": old["mtime"]})
-            if old and old["version"] == version:
-                if mtime > old["mtime"]:
-                    self.db.execute("UPDATE ai_files SET mtime=? WHERE vault_id=? AND path=?", (mtime, vid, path))
-                return self.meta(vid, path)  # type: ignore[return-value]
-            if offload:
-                if self.storage is None:
-                    raise RuntimeError("S3 offload is required but storage is unavailable")
-                self.storage.s3_put_object(self._s3_key(vid, path, version), data)
             self.db.execute(
                 """INSERT INTO ai_files(vault_id,path,version,mtime,size,kind,content,backend) VALUES(?,?,?,?,?,?,?,?)
                    ON CONFLICT(vault_id,path) DO UPDATE SET version=excluded.version, mtime=excluded.mtime,
@@ -110,19 +125,17 @@ class AiStore:
             )
         if old:
             self._delete_s3(vid, path, old["version"], old["backend"])
-        meta = self.meta(vid, path)
-        for cb in self.on_put:
-            cb(vid, meta, data)  # type: ignore[arg-type]
-        return meta  # type: ignore[return-value]
+        return self.meta(vid, path)
 
     def delete(self, vid: str, path: str) -> None:
-        old = self.db.one("SELECT version,backend FROM ai_files WHERE vault_id=? AND path=?", (vid, path))
-        if old:
-            self._delete_s3(vid, path, old["version"], old["backend"])
-        with self.db.transaction():
-            self.db.execute("DELETE FROM ai_files WHERE vault_id=? AND path=?", (vid, path))
-        for cb in self.on_delete:
-            cb(vid, path)  # synchronous removal from the index
+        with self._lock((vid, path)):
+            old = self.db.one("SELECT version,backend FROM ai_files WHERE vault_id=? AND path=?", (vid, path))
+            if old:
+                self._delete_s3(vid, path, old["version"], old["backend"])
+            with self.db.transaction():
+                self.db.execute("DELETE FROM ai_files WHERE vault_id=? AND path=?", (vid, path))
+            for cb in self.on_delete:
+                cb(vid, path)  # synchronous removal from the index
 
     def clear(self, vid: str) -> None:
         rows = self.db.query("SELECT path,version,backend FROM ai_files WHERE vault_id=?", (vid,))

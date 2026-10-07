@@ -7,6 +7,8 @@ from .db import Database, now_ms
 from .errors import ApiError
 
 ACK_STATUSES = {"applied", "conflict", "rejected"}
+MAX_PENDING_CHANGES = 500  # per vault
+MAX_CHANGE_BYTES = 2 * 1024 * 1024  # one MCP write_note
 
 
 def _obj(r) -> dict:
@@ -14,6 +16,7 @@ def _obj(r) -> dict:
         "id": r["id"], "path": r["path"], "op": r["op"], "content": r["content"],
         "base_version": r["base_version"], "status": r["status"], "message": r["message"],
         "new_version": r["new_version"], "created_at": r["created_at"], "token_name": r["token_name"],
+        "token_id": r["token_id"],
     }
 
 
@@ -47,6 +50,9 @@ class ChangeQueue:
         else:
             rows = self.db.query("SELECT * FROM changes WHERE vault_id=? ORDER BY created_at, id", (vid,))
         return [_obj(r) for r in rows]
+
+    def pending_total(self, vid: str) -> int:
+        return self.db.one("SELECT COUNT(*) c FROM changes WHERE vault_id=? AND status='pending'", (vid,))["c"]
 
     def pending_count(self, vid: str, path: str) -> int:
         return self.db.one("SELECT COUNT(*) c FROM changes WHERE vault_id=? AND path=? AND status='pending'",

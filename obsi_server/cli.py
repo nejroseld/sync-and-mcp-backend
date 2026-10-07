@@ -30,7 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--kind", choices=["device", "mcp", "admin"], required=True)
     t.add_argument("--name", required=True)
     t.add_argument("--vault", action="append", default=[], help="vault id (repeatable)")
-    t.add_argument("--ops", default="", help="comma-separated operations for the given vaults")
+    t.add_argument("--ops", default="", help="comma-separated operations for the given vaults "
+                                            "(an AI assistant usually needs only list,search,read)")
     v = a.add_parser("create-vault")
     v.add_argument("--name", required=True)
     a.add_parser("list-vaults")
@@ -41,10 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("token_id")
     g.add_argument("--vault", required=True)
     g.add_argument("--ops", required=True)
-    e = a.add_parser("set-embedding")
-    e.add_argument("--base-url", required=True)
-    e.add_argument("--api-key", default="")
-    e.add_argument("--model", required=True)
+    ri = a.add_parser("revoke-invite", help="revoke an unused registration invite")
+    ri.add_argument("invite_id")
+    e = a.add_parser("set-embedding", help="configure the embedding endpoint; omitted values are kept")
+    e.add_argument("--base-url")
+    e.add_argument("--model")
+    key = e.add_mutually_exclusive_group()
+    key.add_argument("--api-key-file", help="read the API key from a file readable only by its owner (chmod 600)")
+    key.add_argument("--api-key-prompt", action="store_true", help="type the API key without echo")
+    key.add_argument("--clear-api-key", action="store_true", help="remove the stored API key")
+    key.add_argument("--api-key", help=argparse.SUPPRESS)
     for name in ("rag-enable", "rag-disable", "reindex"):
         x = a.add_parser(name)
         x.add_argument("vault")
@@ -53,6 +60,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _out(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def _api_key(args) -> str | None:
+    """None keeps the stored key."""
+    if args.api_key is not None:
+        raise ValueError("--api-key would expose the key in the process list and shell history; "
+                         "use --api-key-file or --api-key-prompt")
+    if args.clear_api_key:
+        return ""
+    if args.api_key_prompt:
+        import getpass
+
+        key = getpass.getpass("Embedding API key: ").strip()
+        if not key:
+            raise ValueError("empty API key")
+        return key
+    if args.api_key_file:
+        path = Path(args.api_key_file)
+        if path.stat().st_mode & 0o077:
+            raise PermissionError(f"{path} must be readable only by its owner (chmod 600)")
+        key = path.read_text(encoding="utf-8").strip()
+        if not key:
+            raise ValueError(f"{path} is empty")
+        return key
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -95,8 +127,10 @@ def main(argv: list[str] | None = None) -> int:
             _out(ctx.auth.revoke(args.token_id).public())
         elif c == "grant":
             _out(ctx.auth.grant(args.token_id, args.vault, _ops(args.ops)).public())
+        elif c == "revoke-invite":
+            _out(ctx.auth.revoke_invite(args.invite_id))
         elif c == "set-embedding":
-            changed = ctx.rag.set_embedding(args.base_url, args.api_key, args.model)
+            changed = ctx.rag.set_embedding(args.base_url, _api_key(args), args.model)
             print("saved" + ("; model/base_url changed, index will be rebuilt" if changed else ""))
         elif c in ("rag-enable", "rag-disable"):
             _out(ctx.vaults.update(args.vault, rag={"enabled": c == "rag-enable"}))

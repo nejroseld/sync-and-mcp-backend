@@ -65,9 +65,12 @@ implicit owner access, не могут создавать vault'ы и управ
 1. **Сервер.** Адрес можно вставить в любом виде: `203.0.113.10`, `ubuntu@host:2222`,
    `ssh root@host -p 2222`. Пользователь по умолчанию `root`, порт `22`.
 2. **Подключение.** Пароль SSH вводится один раз: скрипт держит одно общее соединение
-   на всю сессию. Если пользователь не `root`, один раз запрашивается пароль `sudo` (он
+   на всю сессию. При первом подключении к новому серверу скрипт показывает отпечатки его
+   SSH-ключа и ждёт подтверждения, что они совпадают с панелью или консолью хостинга
+   (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`); без подтверждения пароль не вводится.
+   Если пользователь не `root`, один раз запрашивается пароль `sudo` (он
    хранится только в памяти скрипта). Затем скрипт создаёт ключ `~/.ssh/obsi_mcp_ed25519`
-   и добавляет его на сервер, поэтому следующие запуски обходятся без пароля. Если сервер
+   (права `0600`; при запущенном ssh-agent можно задать парольную фразу) и добавляет его на сервер, поэтому следующие запуски обходятся без пароля. Если сервер
    пускает только по ключу, скрипт попросит путь к ключу от хостинга.
 3. **HTTPS-адрес.** По Enter сервер получает бесплатный адрес вида `203-0-113-10.sslip.io`
    (DNS-сервис, который возвращает IP из имени), свой домен с A-записью на IP сервера тоже
@@ -76,7 +79,8 @@ implicit owner access, не могут создавать vault'ы и управ
    оставляет сервер без HTTPS: тогда он доступен только через SSH-туннель из меню.
 4. **Установка.** Код загружается на VPS и ставится через `install-vps.sh` без вопросов
    (S3 не настраивается). В конце скрипт проверяет `/api/v1/health` и показывает
-   admin-токен и первое приглашение в виде готового сообщения с адресом сервера и кодом.
+   первое приглашение в виде готового сообщения с адресом сервера и кодом; admin-токен
+   выводится на экран только после отдельного подтверждения.
    Его можно переслать или вставить в Obsi Sync самому: «У меня есть приглашение».
 
 Последующие запуски открывают меню. По Enter выполняется пункт по умолчанию (обновление
@@ -108,10 +112,16 @@ sudo ./install-vps.sh
 # другой локальный порт: sudo env OBSI_PORT=9000 ./install-vps.sh
 ```
 
-Скрипт устанавливает Python 3.11+ и зависимости в `/opt/obsi-mcp/venv`, создаёт отдельного
-системного пользователя и сервис `obsi-mcp.service`. Данные хранятся в `/var/lib/obsi-mcp`.
+Скрипт устанавливает Python 3.11+ и создаёт с нуля `/opt/obsi-mcp/venv`. Зависимости ставятся
+только из `requirements.lock` (или `requirements-s3.lock` при настроенном S3) с проверкой хешей,
+поэтому повторный запуск даёт тот же набор пакетов. Код приложения копируется в `/opt/obsi-mcp/src`.
+Скрипт создаёт отдельного
+системного пользователя и сервис `obsi-mcp.service` (`PrivateTmp`, `MemoryHigh=768M`,
+`MemoryMax=1G`, `TasksMax=128`; лимиты памяти меняются через `OBSI_MEMORY_HIGH` и
+`OBSI_MEMORY_MAX`). Данные хранятся в `/var/lib/obsi-mcp`.
 При первой установке создаются admin-токен и первое приглашение; прочитать их можно командой
-`sudo cat /var/lib/obsi-mcp/TOKENS.txt`. В сообщении-приглашении там стоит заглушка
+`sudo cat /var/lib/obsi-mcp/TOKENS.txt`; на экран приглашение выводится, только если вывод
+идёт в терминал. Приглашение действует 7 дней. В сообщении-приглашении там стоит заглушка
 `<your server address>`: замените её публичным HTTPS-адресом перед пересылкой. Повторный запуск обновляет приложение и сервис, сохраняя
 данные и ранее выданные токены. Настройки S3 и необязательные ключи доступа сохраняются
 в `/etc/obsi-mcp/s3.env` с правами `0600`; при отсутствии этого файла используется только
@@ -119,6 +129,8 @@ sudo ./install-vps.sh
 
 Проверка: `curl http://127.0.0.1:8765/api/v1/health`; состояние:
 `sudo systemctl status obsi-mcp`; логи: `sudo journalctl -u obsi-mcp -f`.
+Без токена `/api/v1/health` с внешнего адреса отвечает только `{"ok": true}`; версия и
+модули видны с localhost или с любым действующим токеном.
 Сервис слушает только `127.0.0.1`. Для доступа с другого устройства настройте reverse proxy
 с HTTPS на VPS и укажите его публичный URL в плагине и MCP-клиенте (`/mcp`).
 
@@ -129,7 +141,8 @@ sudo ./install-vps.sh
 ```
 
 При первом запуске создаёт `.venv`, ставит зависимости, заводит admin-токен и первое
-приглашение и пишет их в `data/TOKENS.txt`; приглашение печатается и готовым сообщением.
+приглашение и пишет их в `data/TOKENS.txt`; в терминал приглашение печатается и готовым
+сообщением. Зависимости ставятся из `requirements.lock` с проверкой хешей.
 Каталог данных и его содержимое доступны только владельцу (`0700` для каталогов,
 `0600` для файлов), в том числе при повторном запуске со старыми данными.
 Если старый `TOKENS.txt` раньше был доступен другим локальным пользователям,
@@ -220,13 +233,21 @@ python3 -m obsi_server --data-dir ./data serve --host 0.0.0.0 --port 8765
 | `OBSI_DATA_DIR` | `./obsi-data` | sqlite-база и блобы (`vaults/<vid>/blobs/<sha256(key)>`) |
 | `OBSI_HOST` / `OBSI_PORT` | `127.0.0.1` / `8765` | адрес |
 | `OBSI_FEATURES` | `ai,mcp,rag` | включённые модули (`all`, `none`); `mcp` и `rag` требуют `ai` |
-| `OBSI_MAX_BODY_MB` | `200` | лимит для загрузки файлов; JSON API ограничен 1 MiB, вход и регистрация — 16 KiB, MCP — 8 MiB |
+| `OBSI_MAX_BODY_MB` | `200` | лимит для загрузки зашифрованных файлов (тело пишется во временный файл в `DATA_DIR/tmp`, не в память); JSON API ограничен 1 MiB, вход и регистрация — 16 KiB, MCP — 8 MiB |
+| `OBSI_MAX_AI_FILE_MB` | `32` | лимит одного файла AI Available (держится в памяти и в SQLite) |
+| `OBSI_VAULT_QUOTA_MB` | `10240` | квота vault'а: шифротекст + AI Available + ожидающие MCP-правки; `0` — без квоты; превышение → `507 quota_exceeded` |
+| `OBSI_MAX_CONCURRENT_UPLOADS` | `4` | одновременных загрузок больше 1 MiB; остальные ждут очереди |
 | `OBSI_SYNC_REQUESTS_PER_MINUTE` | `6000` | предел запросов на авторизованный токен в минуту; увеличьте для особенно интенсивной синхронизации |
 | `OBSI_RAG_WORKER` | `1` | фоновый поток эмбеддингов |
-| `OBSI_CORS_ORIGINS` | `*` | список через запятую |
+| `OBSI_CORS_ORIGINS` | `app://obsidian.md,capacitor://localhost,http://localhost` | явный список origin через запятую; `*` не принимается |
+| `OBSI_API_DOCS` | `0` | `1` включает `/docs`, `/redoc`, `/openapi.json` (только для разработки) |
+| `OBSI_SESSION_TTL_DAYS` / `OBSI_SESSION_IDLE_DAYS` | `180` / `30` | срок жизни сессии после входа и срок без использования; на пользователя живёт не больше 10 сессий |
+| `OBSI_INVITE_TTL_DAYS` | `7` | срок действия приглашения |
+| `OBSI_EMBEDDING_ALLOW_PRIVATE` | `0` | `1` разрешает `http://` и частные адреса для эмбеддингов (локальный Ollama); иначе только публичный `https` |
 | `OBSI_S3_BUCKET` | не задан | бакет для вложений больше порога; нужны учётные данные boto3 |
 | `OBSI_S3_THRESHOLD_MB` | `10` | порог выгрузки файлов, кроме `.md` |
 | `OBSI_S3_REGION` / `OBSI_S3_ENDPOINT` / `OBSI_S3_PREFIX` | не задан / не задан / `obsi` | параметры S3 |
+| `OBSI_S3_SSE` / `OBSI_S3_KMS_KEY_ID` | `auto` / не задан | шифрование объектов на стороне S3: `AES256`, `aws:kms`, `none`; `auto` — `AES256` для AWS, `none` при своём endpoint |
 
 Пример TOML: `[server]\ndata_dir="/srv/obsi"\nfeatures=["ai","mcp"]\nmax_body_mb=500`.
 
@@ -254,9 +275,15 @@ python3 -m obsi_server --data-dir ./data admin list-users
 Для общей папки или MCP-клиента можно отдельно создать vault и токен с грантами через CLI
 или admin REST API (`/api/v1/admin/...`).
 
-Другие команды: `list-invites`, `list-vaults`, `list-tokens`, `revoke TOKEN_ID`, `grant TOKEN_ID --vault V --ops a,b`,
+Другие команды: `list-invites`, `revoke-invite INVITE_ID`, `list-vaults`, `list-tokens`, `revoke TOKEN_ID`, `grant TOKEN_ID --vault V --ops a,b`,
 `rag-enable V`, `rag-disable V`, `reindex V`,
-`set-embedding --base-url http://localhost:11434/v1 --api-key KEY --model nomic-embed-text`.
+`set-embedding --base-url https://api.example.com/v1 --model text-embedding-3-small --api-key-file ~/emb.key`
+(файл ключа с правами `0600`; `--api-key-prompt` спрашивает ключ без эха, `--clear-api-key` удаляет его).
+Не переданные параметры не меняются. Ключ в аргументах командной строки не принимается: он
+виден в списке процессов и истории shell. Адрес эмбеддингов должен быть публичным `https`:
+сервер проверяет адрес при сохранении и при каждом подключении, не следует редиректам и
+не использует `HTTP_PROXY`. Для локального Ollama (`http://localhost:11434/v1`) запустите
+сервер с `OBSI_EMBEDDING_ALLOW_PRIVATE=1`.
 Смена `model` или `base-url` сбрасывает векторы, индекс перестраивается в фоне (работающий сервер
 подхватывает изменения из CLI в течение ~10 секунд).
 
@@ -267,6 +294,9 @@ python3 -m obsi_server --data-dir ./data admin list-users
 ## Подключение MCP-клиентов
 
 Endpoint: `http://HOST:8765/mcp`, авторизация `Authorization: Bearer <mcp-токен>`.
+Для ассистента достаточно операций `list,search,read`; `write` выдавайте, только если он должен
+предлагать правки (они всё равно применяются плагином, а не сервером). Текст заметок в ответах
+MCP помечен как недоверенные данные: модель не должна исполнять инструкции из заметок.
 
 ```bash
 claude mcp add --transport http obsi http://HOST:8765/mcp --header "Authorization: Bearer obsi_..."
@@ -285,7 +315,7 @@ Authorization.
 ## Тесты
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -t tests -v
 ```
 
 ## Smoke-тест (выполнялся вручную)
@@ -294,7 +324,7 @@ python3 -m unittest discover -s tests -v
 export OBSI_DATA_DIR=/tmp/obsi-smoke
 python3 -m obsi_server serve --port 18765 &
 curl -s http://127.0.0.1:18765/api/v1/health
-# {"ok":true,"version":"0.1.0","features":{"ai":true,"mcp":true,"rag":true}}
+# {"ok":true,"version":"0.1.0","features":{"ai":true,"mcp":true,"rag":true}}  (с localhost)
 curl -s -X POST http://127.0.0.1:18765/mcp -H "Authorization: Bearer $MCP" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 # {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"obsi-mcp",...}}}

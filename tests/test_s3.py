@@ -12,9 +12,11 @@ from obsi_server.storage import Storage
 class FakeS3:
     def __init__(self):
         self.objects = {}
+        self.put_args = []
 
-    def put_object(self, Bucket, Key, Body):
-        self.objects[(Bucket, Key)] = bytes(Body)
+    def put_object(self, Bucket, Key, Body, **extra):
+        self.objects[(Bucket, Key)] = Body.read() if hasattr(Body, "read") else bytes(Body)
+        self.put_args.append(extra)
 
     def get_object(self, Bucket, Key):
         return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
@@ -61,6 +63,59 @@ class S3StorageTests(unittest.TestCase):
         self.storage.put("v", "opaque", b"large again", None, None, is_markdown=False)
         self.storage.delete("v", "opaque")
         self.assertNotIn(("bucket", remote_key), self.s3.objects)
+
+    def test_server_side_encryption_follows_config(self):
+        self.storage.put("v", "aws", b"x", None, None, is_markdown=False)
+        self.assertEqual(self.s3.put_args[-1], {"ServerSideEncryption": "AES256"})
+        self.config.s3_endpoint = "https://s3.example.net"
+        self.storage.put("v", "compatible", b"x", None, None, is_markdown=False)
+        self.assertEqual(self.s3.put_args[-1], {})
+        self.config.s3_sse, self.config.s3_kms_key_id = "aws:kms", "key-1"
+        self.storage.put("v", "kms", b"x", None, None, is_markdown=False)
+        self.assertEqual(self.s3.put_args[-1], {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": "key-1"})
+
+    def test_spooled_upload_is_moved_or_streamed_and_removed(self):
+        from obsi_server.uploads import Upload, tmp_dir
+        import hashlib
+
+        for key, is_md in (("local", True), ("remote", False)):
+            path = tmp_dir(Path(self.tmp.name)) / f".up-{key}"
+            path.write_bytes(b"spooled")
+            upload = Upload(path, 7, hashlib.sha256(b"spooled").hexdigest())
+            obj = self.storage.put("v", key, upload, None, None, is_markdown=is_md)
+            self.assertEqual((obj["size"], obj["etag"]), (7, upload.sha256))
+            self.assertEqual(self.storage.read("v", key), b"spooled")
+            self.assertFalse(path.exists())
+
+    def test_quota_rejects_before_writing(self):
+        self.config.vault_quota_bytes = 10
+        self.storage.put("v", "a", b"12345678", None, None, is_markdown=True)
+        self.storage.put("v", "a", b"1234567890", None, None, is_markdown=True)  # replacing frees the old size
+        from obsi_server.errors import ApiError
+        with self.assertRaises(ApiError) as e:
+            self.storage.put("v", "b", b"1", None, None, is_markdown=True)
+        self.assertEqual((e.exception.status, e.exception.code), (507, "quota_exceeded"))
+        self.assertIsNone(self.storage.stat("v", "b"))
+
+    def test_concurrent_puts_of_one_key_keep_row_and_backend_consistent(self):
+        import threading
+
+        self.config.s3_threshold_mb = 0
+
+        def writer(i):
+            for n in range(20):
+                self.storage.put("v", "same", f"{i}-{n}".encode(), None, None, is_markdown=(n + i) % 2 == 0)
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        row = self.db.one("SELECT backend FROM blobs WHERE key='same'")
+        remote = ("bucket", self.storage._s3_key("v", "same")) in self.s3.objects
+        local = self.storage.blob_path("v", "same").exists()
+        self.assertEqual((remote, local), (row["backend"] == "s3", row["backend"] == "local"))
+        self.storage.read("v", "same")
 
     def test_without_bucket_large_attachment_stays_local(self):
         cfg = SimpleNamespace(s3_bucket=None, s3_threshold_mb=0)

@@ -65,13 +65,30 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE ai_files ADD COLUMN backend TEXT NOT NULL DEFAULT 'local';
     """,
+    # Login/register sessions are exactly 'user:' + the owner's username, kind=device, no grants.
     """
     ALTER TABLE tokens ADD COLUMN is_session INTEGER NOT NULL DEFAULT 0;
-    UPDATE tokens SET is_session=1 WHERE user_id IS NOT NULL AND name LIKE 'user:%';
+    UPDATE tokens SET is_session=1 WHERE user_id IS NOT NULL AND kind='device' AND grants='{}'
+        AND name = 'user:' || (SELECT username FROM users WHERE users.id=tokens.user_id);
     """,
     """
     CREATE TABLE rate_limits(key TEXT PRIMARY KEY, tat_ms INTEGER NOT NULL);
     CREATE INDEX rate_limits_expiry ON rate_limits(tat_ms);
+    """,
+    # Databases upgraded with the old prefix-based is_session migration may hold promoted
+    # delegated tokens; demote every session that does not match the login/register shape.
+    """
+    UPDATE tokens SET is_session=0 WHERE is_session=1 AND NOT (
+        user_id IS NOT NULL AND kind='device' AND grants='{}'
+        AND name = 'user:' || COALESCE((SELECT username FROM users WHERE users.id=tokens.user_id), ''));
+    ALTER TABLE tokens ADD COLUMN expires_at INTEGER;
+    UPDATE tokens SET expires_at = CAST(strftime('%s','now') AS INTEGER) * 1000 + 180 * 86400000
+        WHERE is_session=1 AND revoked_at IS NULL;
+    CREATE INDEX tokens_user_session ON tokens(user_id, is_session);
+    ALTER TABLE invites ADD COLUMN expires_at INTEGER;
+    ALTER TABLE invites ADD COLUMN revoked_at INTEGER;
+    UPDATE invites SET expires_at = CAST(strftime('%s','now') AS INTEGER) * 1000 + 7 * 86400000
+        WHERE used_at IS NULL;
     """,
 ]
 
@@ -98,8 +115,12 @@ class Database:
         with self.lock:
             version = self.conn.execute("PRAGMA user_version").fetchone()[0]
             for i in range(version, len(MIGRATIONS)):
-                self.conn.executescript(MIGRATIONS[i])
-                self.conn.execute(f"PRAGMA user_version={i + 1}")
+                try:
+                    self.conn.executescript(f"BEGIN IMMEDIATE;\n{MIGRATIONS[i]}\nPRAGMA user_version={i + 1};\nCOMMIT;")
+                except BaseException:
+                    if self.conn.in_transaction:
+                        self.conn.execute("ROLLBACK")
+                    raise
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
         with self.lock:

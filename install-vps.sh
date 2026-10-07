@@ -10,6 +10,8 @@ SERVICE_FILE=/etc/systemd/system/obsi-mcp.service
 S3_ENV_FILE=/etc/obsi-mcp/s3.env
 PORT="${OBSI_PORT:-8765}"
 S3_MODE="${OBSI_S3_MODE:-auto}"
+MEMORY_HIGH="${OBSI_MEMORY_HIGH:-768M}"
+MEMORY_MAX="${OBSI_MEMORY_MAX:-1G}"
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -22,6 +24,10 @@ env_line() {
 
 [[ $EUID -eq 0 ]] || die 'Run with sudo: sudo ./install-vps.sh'
 [[ -f $SOURCE_DIR/pyproject.toml && -d $SOURCE_DIR/obsi_server ]] || die 'Run from the server repository checkout'
+[[ -f $SOURCE_DIR/requirements.lock && -f $SOURCE_DIR/requirements-s3.lock ]] || die 'requirements.lock files are missing from the checkout'
+for limit in "$MEMORY_HIGH" "$MEMORY_MAX"; do
+  [[ $limit =~ ^[0-9]+[KMGT]?$ || $limit == infinity ]] || die 'OBSI_MEMORY_HIGH/OBSI_MEMORY_MAX must look like 768M, 2G or infinity'
+done
 [[ -f /etc/os-release ]] || die 'Ubuntu is required'
 # shellcheck disable=SC1091
 . /etc/os-release
@@ -108,14 +114,31 @@ fi
 install -d -m 0755 "$APP_DIR"
 install -d -m 0700 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR"
 
-if [[ ! -x $APP_DIR/venv/bin/python ]]; then
-  "$PYTHON" -m venv "$APP_DIR/venv" || die "Cannot create venv with $PYTHON; install its matching python3.x-venv package"
-fi
-if [[ -f $S3_ENV_FILE ]]; then
-  "$APP_DIR/venv/bin/python" -m pip install --upgrade "${SOURCE_DIR}[s3]"
-else
-  "$APP_DIR/venv/bin/python" -m pip install --upgrade "$SOURCE_DIR"
-fi
+# Dependencies come only from the hash-pinned lock, into a fresh venv, so a rerun reproduces
+# the same package set. The application itself is plain Python and is not built by pip.
+LOCK=$SOURCE_DIR/requirements.lock
+[[ -f $S3_ENV_FILE ]] && LOCK=$SOURCE_DIR/requirements-s3.lock
+rm -rf -- "$APP_DIR/venv.new" "$APP_DIR/src.new"
+"$PYTHON" -m venv "$APP_DIR/venv.new" || die "Cannot create venv with $PYTHON; install its matching python3.x-venv package"
+"$APP_DIR/venv.new/bin/python" -m pip install --quiet --no-cache-dir --disable-pip-version-check --require-hashes --only-binary=:all: -r "$LOCK" \
+  || die 'Installing pinned dependencies failed'
+install -d -m 0755 "$APP_DIR/src.new"
+cp -R -- "$SOURCE_DIR/obsi_server" "$APP_DIR/src.new/obsi_server"
+find "$APP_DIR/src.new" -name __pycache__ -prune -exec rm -rf {} +
+chmod -R u=rwX,go=rX "$APP_DIR/src.new"
+SITE=$("$APP_DIR/venv.new/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+printf '%s\n' "$APP_DIR/src" > "$SITE/obsi-mcp.pth"
+rm -rf -- "$APP_DIR/venv.old" "$APP_DIR/src.old"
+if [[ -e $APP_DIR/venv ]]; then mv -- "$APP_DIR/venv" "$APP_DIR/venv.old"; fi
+if [[ -e $APP_DIR/src ]]; then mv -- "$APP_DIR/src" "$APP_DIR/src.old"; fi
+mv -- "$APP_DIR/venv.new" "$APP_DIR/venv"
+mv -- "$APP_DIR/src.new" "$APP_DIR/src"
+cat > "$APP_DIR/venv/bin/obsi-server" <<EOF
+#!/bin/sh
+exec $APP_DIR/venv/bin/python -m obsi_server "\$@"
+EOF
+chmod 0755 "$APP_DIR/venv/bin/obsi-server"
+"$APP_DIR/venv/bin/obsi-server" --help >/dev/null || die 'The installed server does not start'
 
 obsi() { runuser -u "$APP_USER" -- "$APP_DIR/venv/bin/obsi-server" --data-dir "$DATA_DIR" "$@"; }
 json_field() { "$APP_DIR/venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
@@ -149,7 +172,11 @@ Publish the service through a TLS reverse proxy before connecting from another m
 EOF
   chmod 0600 "$TOKENS_FILE"
   echo "Credentials saved to $TOKENS_FILE (root access only)"
-  printf 'First user invitation (one use); set the server address and forward this whole message:\n\n%s\n\n' "$MESSAGE"
+  # Only to a terminal: captured installer output ends up in logs.
+  if [[ -t 1 ]]; then
+    printf 'First user invitation (one use); set the server address and forward this whole message:\n\n%s\n\n' "$MESSAGE"
+  fi
+  ADMIN='' INVITE='' MESSAGE=''
 else
   echo "Tokens already exist; $TOKENS_FILE is absent. Existing tokens cannot be recovered." >&2
 fi
@@ -172,7 +199,11 @@ UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+PrivateTmp=true
 ReadWritePaths=$DATA_DIR
+MemoryHigh=$MEMORY_HIGH
+MemoryMax=$MEMORY_MAX
+TasksMax=128
 
 [Install]
 WantedBy=multi-user.target
@@ -181,6 +212,7 @@ EOF
 systemctl daemon-reload
 systemctl enable obsi-mcp.service
 systemctl restart obsi-mcp.service
+rm -rf -- "$APP_DIR/venv.old" "$APP_DIR/src.old"
 echo "Service: $(systemctl is-active obsi-mcp.service)"
 echo "Health: http://127.0.0.1:$PORT/api/v1/health"
 echo "Credentials: sudo cat $TOKENS_FILE"

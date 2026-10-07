@@ -20,13 +20,15 @@ if [ ! -x .venv/bin/obsi-server ]; then
   .venv/bin/pip install -q --upgrade pip
   NEW_VENV=1
 fi
+install_locked() { # LOCKFILE — pinned, hash-checked dependencies, then this checkout in editable mode
+  .venv/bin/pip install -q --require-hashes -r "$1" && .venv/bin/pip install -q --no-deps -e .
+}
+if [ "$NEW_VENV" -eq 1 ]; then
+  install_locked requirements.lock
+fi
 S3_BUCKET=$(.venv/bin/python -c 'from obsi_server.config import Config; print(Config.load().s3_bucket or "")')
-if [ -n "$S3_BUCKET" ]; then
-  if [ "$NEW_VENV" -eq 1 ] || ! .venv/bin/python -c 'import boto3' 2>/dev/null; then
-    .venv/bin/pip install -q -e '.[s3]'
-  fi
-elif [ "$NEW_VENV" -eq 1 ]; then
-  .venv/bin/pip install -q -e .
+if [ -n "$S3_BUCKET" ] && ! .venv/bin/python -c 'import boto3' 2>/dev/null; then
+  install_locked requirements-s3.lock
 fi
 obsi() { .venv/bin/obsi-server --data-dir "$DATA" "$@"; }
 token_of() { sed -n '/{/,$p' | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
@@ -61,14 +63,18 @@ $MESSAGE
 The user then picks a username and an account password, creates their own server vault
 and chooses a separate encryption password.
 For another user, run: obsi-server --data-dir "$DATA" admin create-invite --name NAME
-For an AI assistant, create an MCP token with a grant on a chosen vault.
+For an AI assistant, create an MCP token with a grant on a chosen vault; list,search,read is
+enough to read notes, add write only if the assistant should propose edits.
 
 Debug:
 curl -v $URL/api/v1/health
 curl -v -H "Authorization: Bearer $ADMIN" $URL/api/v1/me
 EOF
   echo "==> Tokens saved to $DATA/TOKENS.txt"
-  printf '==> First user invitation (one use), forward this whole message:\n\n%s\n\n' "$MESSAGE"
+  if [ -t 1 ]; then
+    printf '==> First user invitation (one use), forward this whole message:\n\n%s\n\n' "$MESSAGE"
+  fi
+  ADMIN='' INVITE='' MESSAGE=''
 fi
 
 echo "==> obsi-mcp on http://$HOST:$PORT  (data: $DATA, tokens: $DATA/TOKENS.txt)  Ctrl+C to stop"

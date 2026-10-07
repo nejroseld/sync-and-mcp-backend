@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from obsi_server.app import create_app
 from obsi_server.config import Config
+from obsi_server.mcp import UNTRUSTED_CLOSE, UNTRUSTED_NOTICE, UNTRUSTED_OPEN
 
 GROUPS = [{"cat", "kitten", "feline"}, {"car", "vehicle", "auto"}, {"money", "bank", "finance"}]
 
@@ -85,4 +86,8 @@ class ServerCase(unittest.TestCase):
         return r.json()["result"]
 
     def data(self, res):
-        return json.loads(res["content"][0]["text"])
+        text = res["content"][0]["text"]
+        if text.startswith(UNTRUSTED_NOTICE):
+            notice, opening, text, closing = text.split("\n")
+            self.assertEqual((opening, closing), (UNTRUSTED_OPEN, UNTRUSTED_CLOSE))
+        return json.loads(text)

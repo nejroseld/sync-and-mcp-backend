@@ -6,8 +6,31 @@ from helpers import ServerCase, sha
 class AuthTests(ServerCase):
     def test_health_no_auth(self):
         r = self.client.get("/api/v1/health")
-        self.assertEqual(r.json()["ok"], True)
+        self.assertEqual(r.json(), {"ok": True})
+        r = self.client.get("/api/v1/health", headers=self.h(self.dev))
         self.assertEqual(r.json()["features"], {"ai": True, "mcp": True, "rag": True})
+
+    def test_api_docs_are_off_and_responses_are_not_cached(self):
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            self.assertEqual(self.client.get(path).status_code, 404)
+        r = self.client.post("/api/v1/admin/tokens", headers=self.h(self.admin), json={"name": "x", "kind": "device"})
+        self.assertEqual(r.headers["cache-control"], "no-store")
+
+    def test_cors_allows_only_listed_origins(self):
+        def preflight(origin):
+            return self.client.options("/api/v1/me", headers={
+                "Origin": origin, "Access-Control-Request-Method": "GET"})
+        self.assertEqual(preflight("app://obsidian.md").headers.get("access-control-allow-origin"), "app://obsidian.md")
+        self.assertIsNone(preflight("https://evil.example").headers.get("access-control-allow-origin"))
+        from obsi_server.config import Config
+        with self.assertRaises(ValueError):
+            Config.load({"OBSI_CORS_ORIGINS": "*"})
+
+    def test_overflowing_number_header_is_422(self):
+        for value in ("inf", "nan", "1e400", "1e30"):
+            r = self.client.put(f"/api/v1/vaults/{self.vid}/files/k", content=b"x",
+                                headers=self.h(self.dev, **{"X-Mtime-Cli": value}))
+            self.assertEqual(r.status_code, 422, value)
 
     def test_missing_and_bad_token(self):
         for hdr in ({}, {"Authorization": "Bearer nope"}):
@@ -148,6 +171,24 @@ class StorageTests(ServerCase):
         self.ctx.config.max_body_bytes = 10
         r = self.client.put(self.url("big"), content=b"x" * 11, headers=self.h(self.dev))
         self.assertEqual(r.status_code, 413)
+        self.assertEqual(list((self.ctx.config.data_dir / "tmp").iterdir()), [])
+
+    def test_vault_quota_covers_sync_ai_and_mcp_writes(self):
+        self.ctx.config.vault_quota_bytes = 100
+        self.assertEqual(self.client.put(self.url("a"), content=b"x" * 60, headers=self.h(self.dev)).status_code, 200)
+        r = self.client.put(self.url("b"), content=b"x" * 50, headers=self.h(self.dev))
+        self.assertEqual((r.status_code, r.json()["error"]["code"]), (507, "quota_exceeded"))
+        r = self.client.put(f"/api/v1/vaults/{self.vid}/ai/files/n.md", content=b"x" * 50, headers=self.h(self.dev))
+        self.assertEqual(r.status_code, 507)
+        res = self.call("write_note", {"vault": self.vid, "path": "n.md", "content": "x" * 50, "base_version": None})
+        self.assertTrue(res["isError"])
+        self.assertEqual(self.client.put(self.url("a"), content=b"x" * 90, headers=self.h(self.dev)).status_code, 200)
+
+    def test_ai_file_limit_is_separate_from_sync_limit(self):
+        self.ctx.config.max_ai_file_bytes = 10
+        r = self.client.put(f"/api/v1/vaults/{self.vid}/ai/files/a.md", content=b"x" * 11, headers=self.h(self.dev))
+        self.assertEqual(r.status_code, 413)
+        self.assertEqual(self.client.put(self.url("k"), content=b"x" * 11, headers=self.h(self.dev)).status_code, 200)
 
     def test_delete_vault_removes_blobs(self):
         self.client.put(self.url("k"), content=b"1", headers=self.h(self.dev))
@@ -232,8 +273,8 @@ class ChangesTests(ServerCase):
         r = self.client.get(f"/api/v1/vaults/{self.vid}/changes?status=pending", headers=self.h(self.dev))
         ch = r.json()["changes"]
         self.assertEqual(len(ch), 1)
-        self.assertEqual((ch[0]["id"], ch[0]["op"], ch[0]["content"], ch[0]["base_version"], ch[0]["token_name"]),
-                         (d["change_id"], "update", "new", m["version"], "claude"))
+        self.assertEqual((ch[0]["id"], ch[0]["op"], ch[0]["content"], ch[0]["base_version"], ch[0]["token_name"],
+                          ch[0]["token_id"]), (d["change_id"], "update", "new", m["version"], "claude", self.mcp_tok["id"]))
         r = self.client.post(f"/api/v1/vaults/{self.vid}/changes/{d['change_id']}/ack", headers=self.h(self.dev),
                              json={"status": "applied", "new_version": sha(b"new")})
         self.assertEqual(r.json()["status"], "applied")
@@ -270,6 +311,19 @@ class ChangesTests(ServerCase):
         ok = self.call("write_note", {"vault": self.vid, "path": "brand/new.md", "content": "x", "base_version": None})
         self.assertNotIn("isError", ok)
         self.assertEqual(self.client.get(f"/api/v1/vaults/{self.vid}/changes", headers=self.h(self.dev)).json()["changes"][0]["op"], "create")
+
+    def test_write_note_size_and_queue_limits(self):
+        import obsi_server.mcp as mcp
+        res = self.call("write_note", {"vault": self.vid, "path": "big.md",
+                                       "content": "x" * (mcp.MAX_CHANGE_BYTES + 1), "base_version": None})
+        self.assertTrue(res["isError"])
+        self.addCleanup(setattr, mcp, "MAX_PENDING_CHANGES", mcp.MAX_PENDING_CHANGES)
+        mcp.MAX_PENDING_CHANGES = 2
+        for i in range(2):
+            self.assertNotIn("isError", self.call("write_note", {"vault": self.vid, "path": f"n{i}.md",
+                                                                 "content": "x", "base_version": None}))
+        self.assertTrue(self.call("write_note", {"vault": self.vid, "path": "n3.md", "content": "x",
+                                                 "base_version": None})["isError"])
 
     def test_write_requires_grant(self):
         ro = self.make_token("ro", "mcp", {self.vid: ["list", "read", "search"]})

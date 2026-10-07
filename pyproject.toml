@@ -7,11 +7,13 @@ name = "obsi-server"
 version = "0.1.0"
 description = "obsi-mcp server: E2EE sync storage, AI Available store, MCP endpoint and RAG"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn", "httpx"]
+# Production installs use the hash-pinned requirements*.lock files (see install-vps.sh).
+# httpx is held to one minor release: rag.py replaces its connection pool.
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.28,<0.29", "httpcore>=1.0.5,<2"]
 
 [project.optional-dependencies]
-fast = ["numpy"]
-s3 = ["boto3"]
+fast = ["numpy>=1.26,<3"]
+s3 = ["boto3>=1.34,<2"]
 
 [project.scripts]
 obsi-server = "obsi_server.cli:main"

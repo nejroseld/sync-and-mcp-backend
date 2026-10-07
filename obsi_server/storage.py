@@ -11,6 +11,7 @@ from typing import Any
 
 from .db import Database, now_ms
 from .errors import ApiError
+from .uploads import KeyedLock, Upload, check_quota
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class Storage:
         self.root = Path(data_dir) / "vaults"
         self.config = config
         self._s3 = s3_client
+        self._lock = KeyedLock()
 
     def _s3_client(self):
         if self._s3 is None:
@@ -36,6 +38,13 @@ class Storage:
             self._s3 = boto3.client("s3", region_name=getattr(self.config, "s3_region", None),
                                    endpoint_url=getattr(self.config, "s3_endpoint", None))
         return self._s3
+
+    def _put_args(self) -> dict:
+        put_args = getattr(self.config, "s3_put_args", None)
+        return put_args() if put_args else {}
+
+    def ensure_quota(self, vid: str, adding: int, freeing: int = 0) -> None:
+        check_quota(self.db, int(getattr(self.config, "vault_quota_bytes", 0) or 0), vid, adding, freeing)
 
     def _s3_key(self, vid: str, key: str) -> str:
         prefix = str(getattr(self.config, "s3_prefix", "obsi")).strip("/")
@@ -50,7 +59,7 @@ class Storage:
             raise ApiError(503, "s3_unavailable", "S3 is not configured; set OBSI_S3_BUCKET")
         prefix = str(getattr(self.config, "s3_prefix", "obsi")).strip("/")
         key = "/".join(p for p in (prefix, object_key.lstrip("/")) if p)
-        self._s3_client().put_object(Bucket=bucket, Key=key, Body=data)
+        self._s3_client().put_object(Bucket=bucket, Key=key, Body=data, **self._put_args())
 
     def s3_get_object(self, object_key: str) -> bytes:
         bucket = getattr(self.config, "s3_bucket", None)
@@ -86,22 +95,47 @@ class Storage:
         r = self.db.one("SELECT * FROM blobs WHERE vault_id=? AND key=?", (vid, key))
         return _obj(r) if r else None
 
-    def put(self, vid: str, key: str, data: bytes, mtime_cli: int | None, ctime_cli: int | None,
+    def put(self, vid: str, key: str, data: bytes | Upload, mtime_cli: int | None, ctime_cli: int | None,
             is_markdown: bool | None = None) -> dict:
+        """Store `data` (bytes, or a received Upload that is consumed) for one key."""
+        try:
+            with self._lock((vid, key)):
+                return self._put_locked(vid, key, data, mtime_cli, ctime_cli, is_markdown)
+        finally:
+            if isinstance(data, Upload):
+                data.discard()
+
+    def _put_locked(self, vid: str, key: str, data: bytes | Upload, mtime_cli: int | None,
+                    ctime_cli: int | None, is_markdown: bool | None) -> dict:
+        if isinstance(data, Upload):
+            size, etag = data.size, data.sha256
+        else:
+            size, etag = len(data), hashlib.sha256(data).hexdigest()
         threshold = int(getattr(self.config, "s3_threshold_mb", 10)) * 1024 * 1024
         bucket = getattr(self.config, "s3_bucket", None)
         # Keys are encrypted by the plugin, so an omitted type hint is ambiguous.
         # Keep ambiguous objects local; clients that know the plaintext extension
         # send an explicit false for attachments.
-        offload = bool(bucket) and is_markdown is False and len(data) > threshold
+        offload = bool(bucket) and is_markdown is False and size > threshold
+        old = self.db.one("SELECT backend,size FROM blobs WHERE vault_id=? AND key=?", (vid, key))
+        old_backend = old["backend"] if old else "local"
+        self.ensure_quota(vid, size, old["size"] if old else 0)
         d = self._dir(vid)
         d.mkdir(parents=True, exist_ok=True)
         target = self.blob_path(vid, key)
-        old = self.db.one("SELECT backend FROM blobs WHERE vault_id=? AND key=?", (vid, key))
-        old_backend = old["backend"] if old and "backend" in old.keys() else "local"
         backend = "s3" if offload else "local"
         if offload:
-            self._s3_client().put_object(Bucket=bucket, Key=self._s3_key(vid, key), Body=data)
+            if isinstance(data, Upload):
+                with open(data.path, "rb") as f:
+                    self._s3_client().put_object(Bucket=bucket, Key=self._s3_key(vid, key), Body=f,
+                                                 **self._put_args())
+            else:
+                self._s3_client().put_object(Bucket=bucket, Key=self._s3_key(vid, key), Body=data,
+                                             **self._put_args())
+        elif isinstance(data, Upload):
+            with open(data.path, "rb+") as f:
+                os.fsync(f.fileno())
+            os.replace(data.path, target)
         else:
             tmp = d / f".tmp-{secrets.token_hex(6)}"
             try:
@@ -114,14 +148,13 @@ class Storage:
                 if tmp.exists():
                     tmp.unlink()
         ts = now_ms()
-        etag = hashlib.sha256(data).hexdigest()
         mtime_cli = ts if mtime_cli is None else mtime_cli
         ctime_cli = mtime_cli if ctime_cli is None else ctime_cli
         self.db.execute(
             """INSERT INTO blobs(vault_id,key,size,mtime_cli,ctime_cli,mtime_svr,etag,backend) VALUES(?,?,?,?,?,?,?,?)
                ON CONFLICT(vault_id,key) DO UPDATE SET size=excluded.size, mtime_cli=excluded.mtime_cli,
                ctime_cli=excluded.ctime_cli, mtime_svr=excluded.mtime_svr, etag=excluded.etag, backend=excluded.backend""",
-            (vid, key, len(data), mtime_cli, ctime_cli, ts, etag, backend),
+            (vid, key, size, mtime_cli, ctime_cli, ts, etag, backend),
         )
         if backend == "s3":
             target.unlink(missing_ok=True)
@@ -148,11 +181,12 @@ class Storage:
         return self.blob_path(vid, key).read_bytes()
 
     def delete(self, vid: str, key: str) -> None:
-        row = self.db.one("SELECT backend FROM blobs WHERE vault_id=? AND key=?", (vid, key))
-        if row and row["backend"] == "s3":
-            self._s3_delete(vid, key)
-        self.db.execute("DELETE FROM blobs WHERE vault_id=? AND key=?", (vid, key))
-        self.blob_path(vid, key).unlink(missing_ok=True)
+        with self._lock((vid, key)):
+            row = self.db.one("SELECT backend FROM blobs WHERE vault_id=? AND key=?", (vid, key))
+            if row and row["backend"] == "s3":
+                self._s3_delete(vid, key)
+            self.db.execute("DELETE FROM blobs WHERE vault_id=? AND key=?", (vid, key))
+            self.blob_path(vid, key).unlink(missing_ok=True)
 
     def purge(self, vid: str) -> None:
         rows = self.db.query("SELECT key,backend FROM blobs WHERE vault_id=?", (vid,))

@@ -1,8 +1,10 @@
 """FastAPI app factory: wires services and exposes the REST API and /mcp."""
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Literal
 
@@ -26,7 +28,11 @@ from .mcp import McpServer
 from .rag import EmbedFn, RagService, http_embed
 from .rate_limit import Limit, RateLimiter
 from .storage import Storage
+from .uploads import clear_tmp, receive_upload, tmp_dir
 from .vaults import VaultService
+
+LARGE_BODY_BYTES = 1024 * 1024  # bodies above this (or of unknown size) take an upload slot
+LOCAL_PEERS = ("127.0.0.1", "::1")
 
 
 @dataclass
@@ -47,9 +53,12 @@ def build_context(config: Config, embed_fn: EmbedFn = http_embed) -> Context:
     config.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     db = Database(config.data_dir / "obsi.db")
     vaults, changes = VaultService(db), ChangeQueue(db)
-    auth, storage = AuthService(db), Storage(db, config.data_dir, config)
+    auth = AuthService(db, config.session_ttl_days, config.session_idle_days, config.invite_ttl_days)
+    storage = Storage(db, config.data_dir, config)
     ai = AiStore(db, storage)
-    rag = RagService(db, vaults, ai, embed_fn)
+    if embed_fn is http_embed:
+        embed_fn = functools.partial(http_embed, allow_private=config.embedding_allow_private)
+    rag = RagService(db, vaults, ai, embed_fn, allow_private=config.embedding_allow_private)
     vaults.on_delete += [storage.purge, changes.purge, auth.drop_vault, ai.clear]
     if config.features["rag"]:
         rag.attach()
@@ -126,9 +135,24 @@ def _int_header(request: Request, name: str) -> int | None:
     if v is None or v == "":
         return None
     try:
-        return int(float(v))
-    except ValueError:
-        raise ApiError(422, "validation_error", f"header {name} must be a number")
+        n = int(float(v))
+    except (ValueError, OverflowError):
+        raise ApiError(422, "validation_error", f"header {name} must be a number") from None
+    if not -2**63 <= n < 2**63:  # SQLite INTEGER range
+        raise ApiError(422, "validation_error", f"header {name} is out of range")
+    return n
+
+
+def _upload_slot(request: Request):
+    """Bounds concurrent large bodies; small requests (notes, folders) are not queued behind them."""
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) <= LARGE_BODY_BYTES:
+        return nullcontext()
+    return request.app.state.upload_slots
+
+
+def _is_local(request: Request) -> bool:
+    return bool(request.client) and request.client.host in LOCAL_PEERS
 
 
 # ---- request models ------------------------------------------------------------------
@@ -195,7 +219,10 @@ def core_router() -> APIRouter:
 
     @r.get("/health")
     def health(request: Request):
-        return {"ok": True, "version": __version__, "features": get_ctx(request).config.features}
+        ctx = get_ctx(request)
+        if not _is_local(request) and not ctx.auth.authenticate(_bearer(request)):
+            return {"ok": True}
+        return {"ok": True, "version": __version__, "features": ctx.config.features}
 
     @r.get("/me")
     def me(request: Request, tok: Token = Depends(auth())):
@@ -303,6 +330,10 @@ def admin_router() -> APIRouter:
     @r.get("/invites")
     def list_invites(request: Request):
         return {"invites": get_ctx(request).auth.list_invites()}
+
+    @r.post("/invites/{iid}/revoke")
+    def revoke_invite(iid: str, request: Request):
+        return get_ctx(request).auth.revoke_invite(iid)
 
     @r.post("/vaults")
     def create_vault(body: VaultIn, request: Request):
@@ -412,13 +443,14 @@ def storage_router() -> APIRouter:
     @r.put("/{key:path}")
     async def put_file(vid: str, key: str, request: Request):
         ctx = _access(request, vid, "write")
-        data = await read_body(request, ctx.config.max_body_bytes)
         markdown_header = request.headers.get("x-obsi-markdown")
         if markdown_header is not None and markdown_header not in ("true", "false"):
             raise ApiError(422, "validation_error", "X-Obsi-Markdown must be true or false")
         is_markdown = None if markdown_header is None else markdown_header == "true"
-        return await run_in_threadpool(ctx.storage.put, vid, key, data, _int_header(request, "x-mtime-cli"),
-                                       _int_header(request, "x-ctime-cli"), is_markdown)
+        mtime_cli, ctime_cli = _int_header(request, "x-mtime-cli"), _int_header(request, "x-ctime-cli")
+        async with _upload_slot(request):
+            upload = await receive_upload(request, ctx.config.max_body_bytes, tmp_dir(ctx.config.data_dir))
+            return await run_in_threadpool(ctx.storage.put, vid, key, upload, mtime_cli, ctime_cli, is_markdown)
 
     @r.delete("/{key:path}", status_code=204)
     def delete_file(vid: str, key: str, request: Request):
@@ -443,8 +475,10 @@ def ai_router() -> APIRouter:
     async def ai_put(vid: str, path: str, request: Request):
         ctx = _access(request, vid, "write")
         norm_path(path)
-        data = await read_body(request, ctx.config.max_body_bytes)
-        return await run_in_threadpool(ctx.ai.put, vid, path, data, _int_header(request, "x-mtime"))
+        mtime = _int_header(request, "x-mtime")
+        async with _upload_slot(request):
+            data = await read_body(request, min(ctx.config.max_ai_file_bytes, ctx.config.max_body_bytes))
+            return await run_in_threadpool(ctx.ai.put, vid, path, data, mtime)
 
     @r.delete("/ai/files/{path:path}", status_code=204)
     def ai_delete(vid: str, path: str, request: Request):
@@ -469,8 +503,30 @@ def ai_router() -> APIRouter:
     return r
 
 
+class NoStoreMiddleware:
+    """Responses carry tokens, invite codes and private data: keep them out of every cache."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message):
+            if message["type"] == "http.response.start":
+                headers = [h for h in message.get("headers", []) if h[0].lower() != b"cache-control"]
+                message = {**message, "headers": [*headers, (b"cache-control", b"no-store")]}
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
 def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> FastAPI:
     config = config or Config.load()
+    config.validate()
+    clear_tmp(config.data_dir)
     ctx = build_context(config, embed_fn)
 
     @asynccontextmanager
@@ -481,8 +537,11 @@ def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> 
         ctx.rag.stop_worker()
         ctx.db.close()
 
-    app = FastAPI(title="obsi-mcp", version=__version__, lifespan=lifespan)
+    docs = {} if config.api_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    app = FastAPI(title="obsi-mcp", version=__version__, lifespan=lifespan, **docs)
     app.state.ctx = ctx
+    app.state.upload_slots = asyncio.Semaphore(config.max_concurrent_uploads)
+    app.add_middleware(NoStoreMiddleware)
     app.add_middleware(BodyLimitMiddleware, max_body_bytes=config.max_body_bytes)
     app.add_middleware(CORSMiddleware, allow_origins=config.cors_origins,
                        allow_methods=["GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"],

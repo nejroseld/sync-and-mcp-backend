@@ -6,17 +6,24 @@ background worker (`process_pending`) and may lag behind.
 """
 from __future__ import annotations
 
+import heapq
+import ipaddress
+import json
 import logging
 import re
+import socket
 import threading
 from array import array
 from typing import Callable, Sequence
+from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 
 from .ai_store import AiStore, is_text
 from .db import Database
-from .vaults import VaultService
+from .errors import ApiError
+from .vaults import MAX_CHUNK_CHARS, VaultService
 
 try:  # optional acceleration
     import numpy as np  # type: ignore
@@ -26,24 +33,121 @@ except Exception:  # pragma: no cover
 log = logging.getLogger("obsi.rag")
 
 BATCH_SIZE = 32
-MAX_TEXT_CHARS = 8000
+MAX_TEXT_CHARS = MAX_CHUNK_CHARS
 RRF_K = 60
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_CHUNKS_PER_VAULT = 200_000
+SCAN_BATCH = 2000
+_PRIVATE_SUFFIXES = (".localhost", ".local", ".localdomain", ".internal", ".home.arpa")
 
 EmbedFn = Callable[[dict, list[str]], list[list[float]]]
 
 
-def http_embed(cfg: dict, texts: list[str], timeout: float = 60.0) -> list[list[float]]:
+class EmbeddingError(Exception):
+    """Embedding failure whose message is safe to store and show (no URL, no response body)."""
+
+
+def _public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def check_embedding_url(url: str, allow_private: bool = False) -> str:
+    """Validate an embedding base URL; returns it normalized. Raises ValueError."""
+    url = url.strip().rstrip("/")
+    try:
+        parts = urlsplit(url)
+        parts.port
+    except ValueError:
+        raise ValueError("base_url is not a valid URL") from None
+    schemes = ("https", "http") if allow_private else ("https",)
+    if parts.scheme not in schemes:
+        raise ValueError("base_url must use https")
+    host = (parts.hostname or "").lower()
+    if not host or parts.username is not None or parts.password is not None or parts.fragment:
+        raise ValueError("base_url must be scheme://host[:port]/path without credentials")
+    if allow_private:
+        return url
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if host == "localhost" or host.endswith(_PRIVATE_SUFFIXES) or "." not in host:
+            raise ValueError("base_url must point to a public host") from None
+        return url
+    if not _public_ip(ip):
+        raise ValueError("base_url must point to a public address")
+    return url
+
+
+class _PublicOnlyBackend(httpcore.SyncBackend):
+    """Resolves and checks the address on every connect, so DNS rebinding cannot reach private hosts."""
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError:
+            raise httpcore.ConnectError("name resolution failed") from None
+        addrs = list(dict.fromkeys(ipaddress.ip_address(i[4][0].split("%")[0]) for i in infos))
+        if not addrs or not all(_public_ip(a) for a in addrs):
+            raise httpcore.ConnectError("endpoint resolves to a non-public address")
+        error: Exception = httpcore.ConnectError("connect failed")
+        for addr in addrs:
+            try:
+                return super().connect_tcp(str(addr), port, timeout, local_address, socket_options)
+            except httpcore.ConnectError as e:
+                error = e
+        raise error
+
+
+def _transport(allow_private: bool) -> httpx.HTTPTransport:
+    transport = httpx.HTTPTransport(retries=0)
+    if not allow_private:
+        # httpx has no public hook for the network backend; replace the pool it built.
+        transport._pool = httpcore.ConnectionPool(ssl_context=httpx.create_ssl_context(),
+                                                  network_backend=_PublicOnlyBackend())
+    return transport
+
+
+def http_embed(cfg: dict, texts: list[str], timeout: float = 60.0, allow_private: bool = False) -> list[list[float]]:
     """POST {base_url}/embeddings (OpenAI format). Raises on any failure."""
+    try:
+        url = check_embedding_url(cfg["base_url"], allow_private) + "/embeddings"
+    except ValueError as e:
+        raise EmbeddingError(str(e)) from None
     headers = {"Content-Type": "application/json"}
     if cfg.get("api_key"):
         headers["Authorization"] = "Bearer " + cfg["api_key"]
-    r = httpx.post(cfg["base_url"].rstrip("/") + "/embeddings", headers=headers, timeout=timeout,
-                   json={"model": cfg["model"], "input": [t[:MAX_TEXT_CHARS] for t in texts]})
-    r.raise_for_status()
-    data = sorted(r.json()["data"], key=lambda d: d.get("index", 0))
-    if len(data) != len(texts):
-        raise ValueError("embedding count mismatch")
-    return [d["embedding"] for d in data]
+    body = {"model": cfg["model"], "input": [t[:MAX_TEXT_CHARS] for t in texts]}
+    buf = bytearray()
+    with httpx.Client(transport=_transport(allow_private), timeout=timeout,
+                      follow_redirects=False, trust_env=False) as client:
+        with client.stream("POST", url, headers=headers, json=body) as r:
+            if r.status_code != 200:
+                raise EmbeddingError(f"HTTP {r.status_code}")
+            for chunk in r.iter_bytes():
+                buf += chunk
+                if len(buf) > MAX_RESPONSE_BYTES:
+                    raise EmbeddingError("response too large")
+    try:
+        data = sorted(json.loads(buf)["data"], key=lambda d: d.get("index", 0))
+        vecs = [d["embedding"] for d in data]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise EmbeddingError("malformed response") from None
+    if len(vecs) != len(texts):
+        raise EmbeddingError("embedding count mismatch")
+    return vecs
+
+
+def describe_error(e: Exception) -> str:
+    """Short error label for logs and the admin API: never the URL, key or response body."""
+    if isinstance(e, EmbeddingError):
+        return f"EmbeddingError: {e}"
+    if isinstance(e, httpx.TimeoutException):
+        return "Timeout"
+    if isinstance(e, httpx.ConnectError) and "non-public" in str(e):
+        return "ConnectError: endpoint resolves to a non-public address"
+    return type(e).__name__
 
 
 def chunk_text(text: str, chunk_chars: int, overlap: int) -> list[tuple[int, int, str]]:
@@ -92,9 +196,11 @@ def fts_query(q: str) -> str | None:
 
 
 class RagService:
-    def __init__(self, db: Database, vaults: VaultService, ai: AiStore, embed_fn: EmbedFn = http_embed):
+    def __init__(self, db: Database, vaults: VaultService, ai: AiStore, embed_fn: EmbedFn = http_embed,
+                 allow_private: bool = False):
         self.db, self.vaults, self.ai = db, vaults, ai
         self.embed_fn = embed_fn
+        self.allow_private = allow_private
         self.last_error: str | None = None
         self._event = threading.Event()
         self._stop = threading.Event()
@@ -120,6 +226,13 @@ class RagService:
 
     def set_embedding(self, base_url: str | None, api_key: str | None, model: str | None) -> bool:
         """Store settings; returns True (and drops all vectors) if model or base_url changed."""
+        if base_url is not None:
+            try:
+                base_url = check_embedding_url(base_url, self.allow_private)
+            except ValueError as e:
+                raise ApiError(422, "invalid_embedding_url", str(e)) from None
+        if model is not None and not 0 < len(model) <= 200:
+            raise ApiError(422, "validation_error", "model must be 1 to 200 characters")
         old = self.db.get_setting("embedding", {}) or {}
         new = dict(old)
         for k, v in (("base_url", base_url), ("api_key", api_key), ("model", model)):
@@ -152,6 +265,11 @@ class RagService:
         chunks = chunk_text(text, v["rag"]["chunk_chars"], v["rag"]["chunk_overlap"])
         with self.db.transaction():
             self._delete_chunks("vault_id=? AND path=?", (vid, path))
+            room = MAX_CHUNKS_PER_VAULT - self.db.one("SELECT COUNT(*) n FROM chunks WHERE vault_id=?", (vid,))["n"]
+            if len(chunks) > room:
+                log.warning("vault %s reached %d chunks; indexed %d of %d chunks of one file",
+                            vid, MAX_CHUNKS_PER_VAULT, max(room, 0), len(chunks))
+                chunks = chunks[:max(room, 0)]
             for s, e, body in chunks:
                 cur = self.db.execute(
                     "INSERT INTO chunks(vault_id,path,version,start_line,end_line,text) VALUES(?,?,?,?,?,?)",
@@ -208,7 +326,7 @@ class RagService:
             try:
                 vecs = self.embed_fn(cfg, [r["text"] for r in rows])
             except Exception as e:  # network, HTTP, bad payload: keep chunks pending
-                self.last_error = f"{type(e).__name__}: {e}"
+                self.last_error = describe_error(e)
                 log.warning("embedding failed: %s", self.last_error)
                 return -1
             if self.embedding_cfg() != cfg:  # settings changed meanwhile: discard this batch
@@ -245,7 +363,8 @@ class RagService:
             try:
                 n = self.process_pending()
             except Exception as e:  # never let the worker die
-                self.last_error = f"{type(e).__name__}: {e}"
+                self.last_error = describe_error(e)
+                log.warning("embedding worker failed: %s", self.last_error)
                 n = -1
             if n < 0:
                 self._event.wait(backoff)
@@ -273,24 +392,44 @@ class RagService:
         if not vids:
             return []
         ph = ",".join("?" * len(vids))
-        rows = self.db.query(
-            f"""SELECT c.id, c.vault_id, c.path, c.version, c.start_line, c.end_line, c.text, c.embedding
-                FROM chunks c JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path AND f.version=c.version
-                WHERE c.vault_id IN ({ph}) AND c.emb_key=? AND c.embedding IS NOT NULL""", (*vids, key))
-        rows = [r for r in rows if len(r["embedding"]) == 4 * len(qvec)]
-        if not rows:
+        width = 4 * len(qvec)
+        q = np.frombuffer(qvec.tobytes(), dtype=np.float32) if np is not None else None
+        top: list[tuple[float, int]] = []  # min-heap of the best n (score, chunk id)
+        last = 0
+        while True:
+            rows = self.db.query(
+                f"""SELECT c.id, c.embedding FROM chunks c
+                    JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path AND f.version=c.version
+                    WHERE c.vault_id IN ({ph}) AND c.emb_key=? AND c.embedding IS NOT NULL AND c.id > ?
+                    ORDER BY c.id LIMIT ?""", (*vids, key, last, SCAN_BATCH))
+            if not rows:
+                break
+            last = rows[-1]["id"]
+            rows = [r for r in rows if len(r["embedding"]) == width]
+            if not rows:
+                continue
+            if q is not None:
+                mat = np.frombuffer(b"".join(r["embedding"] for r in rows), dtype=np.float32).reshape(len(rows), -1)
+                scores = (mat @ q).tolist()
+            else:
+                scores = []
+                for r in rows:
+                    a = array("f")
+                    a.frombytes(r["embedding"])
+                    scores.append(sum(x * y for x, y in zip(a, qvec)))
+            for r, s in zip(rows, scores):
+                if len(top) < n:
+                    heapq.heappush(top, (s, -r["id"]))
+                elif s > top[0][0]:
+                    heapq.heapreplace(top, (s, -r["id"]))
+        if not top:
             return []
-        if np is not None:
-            mat = np.vstack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
-            scores = (mat @ np.frombuffer(qvec.tobytes(), dtype=np.float32)).tolist()
-        else:
-            scores = []
-            for r in rows:
-                a = array("f")
-                a.frombytes(r["embedding"])
-                scores.append(sum(x * y for x, y in zip(a, qvec)))
-        order = sorted(range(len(rows)), key=lambda i: -scores[i])[:n]
-        return [dict(rows[i], score=scores[i]) for i in order]
+        best = sorted(top, reverse=True)
+        ids = [-i for _, i in best]
+        details = {r["id"]: r for r in self.db.query(
+            f"""SELECT id, vault_id, path, version, start_line, end_line, text FROM chunks
+                WHERE id IN ({",".join("?" * len(ids))})""", ids)}
+        return [dict(details[-i], score=s) for s, i in best if -i in details]
 
     def search(self, query: str, vault_ids: list[str], mode: str = "hybrid", limit: int = 10) -> tuple[list[dict], str | None]:
         """Search AI Available chunks of the given vaults. Returns (results, note)."""

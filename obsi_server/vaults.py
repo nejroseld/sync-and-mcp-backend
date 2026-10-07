@@ -8,6 +8,8 @@ from typing import Callable
 from .db import Database, now_ms
 from .errors import ApiError
 
+MIN_CHUNK_CHARS, MAX_CHUNK_CHARS = 50, 8000
+
 
 def _public(r) -> dict:
     return {
@@ -57,10 +59,12 @@ class VaultService:
             for k in ("enabled", "chunk_chars", "chunk_overlap"):
                 if rag.get(k) is not None:
                     if k != "enabled":
-                        if int(rag[k]) < 0 or (k == "chunk_chars" and int(rag[k]) < 50):
+                        if int(rag[k]) < 0 or (k == "chunk_chars" and not MIN_CHUNK_CHARS <= int(rag[k]) <= MAX_CHUNK_CHARS):
                             raise ApiError(422, "validation_error", f"bad {k}")
                         rechunk = rechunk or int(rag[k]) != r[k]
                     r[k] = rag[k]
+            if int(r["chunk_overlap"]) >= int(r["chunk_chars"]):
+                raise ApiError(422, "validation_error", "chunk_overlap must be smaller than chunk_chars")
         self.db.execute(
             "UPDATE vaults SET name=?, rag_enabled=?, chunk_chars=?, chunk_overlap=? WHERE id=?",
             (name, int(bool(r["enabled"])), int(r["chunk_chars"]), int(r["chunk_overlap"]), vid),

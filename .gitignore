@@ -4,3 +4,7 @@ obsi-data/
 __pycache__/
 *.egg-info/
 *.py[cod]
+.env
+.env.*
+TOKENS.txt
+*.key

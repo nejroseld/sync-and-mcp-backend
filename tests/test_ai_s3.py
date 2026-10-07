@@ -13,9 +13,11 @@ from obsi_server.storage import Storage
 class FakeS3:
     def __init__(self):
         self.objects = {}
+        self.put_args = []
 
-    def put_object(self, *, Bucket, Key, Body):
-        self.objects[(Bucket, Key)] = bytes(Body)
+    def put_object(self, *, Bucket, Key, Body, **extra):
+        self.objects[(Bucket, Key)] = Body.read() if hasattr(Body, "read") else bytes(Body)
+        self.put_args.append(extra)
 
     def get_object(self, *, Bucket, Key):
         return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
@@ -47,6 +49,7 @@ class AiS3Tests(unittest.TestCase):
                 ai.put("v_one", "image.png", b"first", 1)
                 row = db.one("SELECT backend,content FROM ai_files WHERE vault_id=?", ("v_one",))
                 self.assertEqual((row["backend"], bytes(row["content"])), ("s3", b""))
+                self.assertEqual(fake.put_args, [{"ServerSideEncryption": "AES256"}])
                 self.assertEqual(ai.get("v_one", "image.png")[1], b"first")
                 ai.put("v_one", "image.png", b"second", 2)
                 self.assertEqual(ai.get("v_one", "image.png")[1], b"second")
