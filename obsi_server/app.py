@@ -102,11 +102,21 @@ def auth(*kinds: str):
     return dep
 
 
+def account_device(tok: Token) -> bool:
+    """Password login and a device token issued for that account. MCP stays on its grants."""
+    return tok.kind == "device" and tok.user_id is not None
+
+
+def require_account_device(tok: Token) -> None:
+    if not account_device(tok):
+        raise ApiError(403, "user_account_required", "a device token that belongs to an account is required")
+
+
 def vault_access(ctx: Context, tok: Token, vid: str, op: str) -> None:
     vault = ctx.vaults.get(vid)
     if not vault:
         ctx.vaults.require(vid)
-    owner_access = tok.is_session and tok.user_id is not None and vault["owner_user_id"] == tok.user_id
+    owner_access = account_device(tok) and vault["owner_user_id"] == tok.user_id
     if not owner_access and not tok.can(vid, op):
         raise ApiError(403, "forbidden", f"no '{op}' grant on this vault")
 
@@ -239,7 +249,7 @@ def core_router() -> APIRouter:
         else:
             ids = {v for v in tok.grants if tok.has_any(v)}
             visible = ctx.vaults.list(ids)
-            if tok.is_session and tok.user_id:
+            if account_device(tok):
                 owned = ctx.vaults.list_owned(tok.user_id)
                 known = {v["id"] for v in visible}
                 visible.extend(v for v in owned if v["id"] not in known)
@@ -249,14 +259,12 @@ def core_router() -> APIRouter:
 
     @r.get("/tokens")
     def user_tokens(request: Request, tok: Token = Depends(auth("device"))):
-        if not tok.is_session or not tok.user_id:
-            raise ApiError(403, "session_required", "account session token required")
+        require_account_device(tok)
         return {"tokens": [t.public() for t in get_ctx(request).auth.list_user(tok.user_id)]}
 
     @r.post("/tokens")
     def create_user_token(body: TokenIn, request: Request, tok: Token = Depends(auth("device"))):
-        if not tok.is_session or not tok.user_id:
-            raise ApiError(403, "session_required", "account session token required")
+        require_account_device(tok)
         if body.kind not in ("device", "mcp"):
             raise ApiError(422, "invalid_kind", "user tokens must be kind=device or kind=mcp")
         ctx = get_ctx(request)
@@ -269,8 +277,7 @@ def core_router() -> APIRouter:
 
     @r.patch("/tokens/{tid}")
     def patch_user_token(tid: str, body: TokenPatch, request: Request, tok: Token = Depends(auth("device"))):
-        if not tok.is_session or not tok.user_id:
-            raise ApiError(403, "session_required", "account session token required")
+        require_account_device(tok)
         ctx = get_ctx(request)
         for vid in body.grants or {}:
             vault = ctx.vaults.get(vid)
@@ -280,14 +287,13 @@ def core_router() -> APIRouter:
 
     @r.post("/tokens/{tid}/revoke")
     def revoke_user_token(tid: str, request: Request, tok: Token = Depends(auth("device"))):
-        if not tok.is_session or not tok.user_id:
-            raise ApiError(403, "session_required", "account session token required")
+        require_account_device(tok)
         return get_ctx(request).auth.revoke_user(tok.user_id, tid).public()
 
     @r.post("/vaults")
     def create_user_vault(body: VaultIn, request: Request, tok: Token = Depends(auth("device"))):
-        if not tok.is_session or not tok.user_id:
-            raise ApiError(403, "user_account_required", "a registered user device token is required")
+        # Login and an issued device token both own the account's vaults. MCP is another kind.
+        require_account_device(tok)
         return get_ctx(request).vaults.create(body.name, owner_user_id=tok.user_id)
     return r
 

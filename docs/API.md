@@ -24,13 +24,12 @@ Authorization, Content-Type, X-*; expose `ETag`, `X-*`. Плагин на моб
 * `POST /api/v1/auth/register` `{"invite_code":"...","username":"alice","password":"..."}` → `{"token":"...","user":{"id":"u_...","username":"alice","created_at":...}}`. Код приглашения одноразовый и действует 7 дней (`OBSI_INVITE_TTL_DAYS`); отозванный или просроченный код → `401 invalid_invite`. Имя нормализуется (Unicode NFKC, пробелы по краям удаляются, регистр приводится к нижнему), пароль — от 12 до 1024 символов.
 * `POST /api/v1/auth/login` `{"username":"alice","password":"..."}` → account session token и объект пользователя. `/api/v1/me` сообщает `account_token: true`.
   Session token живёт 180 дней (`OBSI_SESSION_TTL_DAYS`, поле `expires_at`) и гаснет после 30 дней без запросов (`OBSI_SESSION_IDLE_DAYS`); после этого нужен повторный вход (`401`). У пользователя живёт не больше 10 сессий: новый вход отзывает самые давно использованные.
-* `POST /api/v1/vaults` с account session token `{"name":"Private"}` → создаёт принадлежащий пользователю vault. Session token имеет implicit owner access.
-* `GET /api/v1/vaults` для account session показывает его vault'ы и vault'ы, явно выданные через grants.
-* `GET /api/v1/tokens` → список собственных токенов, включая account sessions.
+* `POST /api/v1/vaults` `{"name":"Private"}` с токеном входа или с токеном устройства этого аккаунта → создаёт принадлежащий пользователю vault. Оба имеют доступ владельца ко всем vault'ам аккаунта. Токен без `user_id` и MCP-токен → `403`.
+* `GET /api/v1/vaults` для входа и для токена устройства аккаунта показывает его vault'ы и vault'ы, явно выданные через grants.
+* `GET /api/v1/tokens`, `POST /api/v1/tokens`, `PATCH /api/v1/tokens/{id}` и `POST /api/v1/tokens/{id}/revoke` доступны и входу, и токену устройства аккаунта.
 * `POST /api/v1/tokens` принимает `{"name":"Laptop","kind":"device"|"mcp","grants":{"v_xxx":["read","write"]}}` → токен, секрет которого показывается один раз. Grants разрешены только для принадлежащих пользователю vault'ов. Имена с префиксом `user:` зарезервированы за сессиями (`422 invalid_name`). Для MCP-ассистента рекомендуется `["list","search","read"]`, `write` — только если он должен предлагать правки.
-* `PATCH /api/v1/tokens/{id}` принимает `{"name"?,"grants"?}` для собственного delegated token; `POST /api/v1/tokens/{id}/revoke` отзывает собственный токен.
 
-Delegated device/MCP tokens имеют только явные grants, не могут создавать vault'ы или управлять токенами. Существующие админские `/api/v1/admin/tokens` и их поведение сохранены.
+Токен устройства аккаунта (`kind=device`, есть `user_id`, `is_session: false`) имеет те же права, что вход: все vault'ы аккаунта, создание vault'ов, выпуск и отзыв токенов. Записанные ему grants доступ не сужают. Срок 180/30 дней и лимит в 10 сессий остаются только у `is_session`. MCP-токен по-прежнему ограничен grants и не управляет аккаунтом. Токен без `user_id` тоже. Существующие админские `/api/v1/admin/tokens` и их поведение сохранены.
 
 Admin управляет приглашениями (`kind=admin`): `POST /api/v1/admin/invites` `{"name":"signup"}` возвращает code единожды; `GET /api/v1/admin/invites` возвращает список без кодов с полями `expires_at`, `revoked_at` и `status` (`active`, `used`, `revoked`, `expired`); `POST /api/v1/admin/invites/{id}/revoke` отзывает неиспользованное приглашение.
 `GET /api/v1/admin/users` возвращает зарегистрированных пользователей и количества принадлежащих им vault'ов и пользовательских токенов: `{"users":[{"id":"u_...","username":"alice","created_at":1730000000000,"vault_count":1,"token_count":2}]}`. Доступен только admin-токен.
@@ -125,7 +124,7 @@ Streamable HTTP transport (MCP spec 2025-06-18; принимаем и `2025-03-2
 | `write_note` | `vault`, `path`, `content` (до 2 MiB), `base_version` (null = создать) | `write` | `{change_id, status:"pending"}`; конфликт → isError с текущей `version`; больше 500 ожидающих правок на vault → isError |
 | `get_change_status` | `change_id` | `write` на vault изменения | `{id, status, message, new_version}` |
 
-Поиск идёт только по vault'ам с грантом `search` и только по данным AI Available. Семантический режим
+Поиск идёт только по vault'ам с грантом `search` и только по текущим опубликованным заметкам (`.md` в AI Available той же версии). Вложения и снятые с публикации заметки в индекс не попадают. Семантический режим
 недоступен (→ текстовый, с пометкой), если embedding не настроен или RAG vault'а выключен.
 
 ## Заметки реализации сервера (уточнения к контракту)

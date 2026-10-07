@@ -82,7 +82,7 @@ class UserAccountTests(ServerCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.client.get("/api/v1/vaults", headers=self.h(self.admin)).status_code, 200)
 
-    def test_account_tokens_are_scoped_and_self_managed(self):
+    def test_device_tokens_match_the_account_and_mcp_stays_scoped(self):
         invitation = self.client.post("/api/v1/admin/invites", headers=self.h(self.admin),
                                       json={"name": "Alice"}).json()
         alice = self.register(invitation["code"]).json()
@@ -109,14 +109,35 @@ class UserAccountTests(ServerCase):
         self.assertEqual(issued.status_code, 200, issued.text)
         delegated = issued.json()
         dh = {"Authorization": "Bearer " + delegated["token"]}
-        self.assertFalse(self.client.get("/api/v1/me", headers=dh).json()["account_token"])
-        self.assertEqual(self.client.post("/api/v1/vaults", headers=dh, json={"name": "Nope"}).status_code, 403)
+        me = self.client.get("/api/v1/me", headers=dh).json()
+        self.assertFalse(me["account_token"])
+        self.assertEqual(me["user"]["id"], alice["user"]["id"])
+        created = self.client.post("/api/v1/vaults", headers=dh, json={"name": "Phone folder"})
+        self.assertEqual(created.status_code, 200, created.text)
+        new_id = created.json()["id"]
+        self.assertEqual(created.json()["owner_user_id"], alice["user"]["id"])
+        self.assertEqual(self.client.put(f"/api/v1/vaults/{new_id}/files/note", headers=dh,
+                                        content=b"from the phone").status_code, 200)
         self.assertEqual(self.client.get(f"/api/v1/vaults/{own}/files", headers=dh).status_code, 200)
         self.assertEqual(self.client.put(f"/api/v1/vaults/{own}/files/note", headers=dh,
-                                        content=b"blocked").status_code, 403)
+                                        content=b"owner write").status_code, 200)
         self.assertEqual(self.client.get(f"/api/v1/vaults/{bob_vault}/files", headers=dh).status_code, 403)
-        self.assertEqual([v["id"] for v in self.client.get("/api/v1/vaults", headers=dh).json()["vaults"]], [own])
-        self.assertEqual(self.client.get("/api/v1/tokens", headers=dh).status_code, 403)
+        self.assertEqual(self.client.post("/api/v1/vaults", headers=self.h(self.dev),
+                                         json={"name": "no account"}).status_code, 403)
+        self.assertEqual(self.client.get("/api/v1/tokens", headers=self.h(self.dev)).status_code, 403)
+        self.assertEqual([v["id"] for v in self.client.get("/api/v1/vaults", headers=dh).json()["vaults"]],
+                         [own, new_id])
+        listed_by_device = self.client.get("/api/v1/tokens", headers=dh)
+        self.assertEqual(listed_by_device.status_code, 200, listed_by_device.text)
+        self.assertIn(delegated["id"], [t["id"] for t in listed_by_device.json()["tokens"]])
+        issued_by_device = self.client.post("/api/v1/tokens", headers=dh, json={
+            "name": "tablet", "kind": "device", "grants": {},
+        })
+        self.assertEqual(issued_by_device.status_code, 200, issued_by_device.text)
+        self.assertFalse(issued_by_device.json()["is_session"])
+        tablet = {"Authorization": "Bearer " + issued_by_device.json()["token"]}
+        self.assertEqual(self.client.get(f"/api/v1/vaults/{own}/files", headers=tablet).status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/tokens", headers=tablet).status_code, 200)
         self.assertEqual(self.client.patch(f"/api/v1/tokens/{delegated['id']}", headers=bob_headers,
                                            json={"name": "stolen"}).status_code, 404)
         self.assertEqual(self.client.post(f"/api/v1/tokens/{delegated['id']}/revoke", headers=bob_headers).status_code, 404)
@@ -125,6 +146,11 @@ class UserAccountTests(ServerCase):
         mcp_created = self.client.post("/api/v1/tokens", headers=ah, json={
             "name": "MCP", "kind": "mcp", "grants": {own: ["list", "read"]},
         }).json()
+        mcp_headers = {"Authorization": "Bearer " + mcp_created["token"]}
+        self.assertEqual(self.client.post("/api/v1/vaults", headers=mcp_headers,
+                                         json={"name": "Nope"}).status_code, 403)
+        self.assertEqual(self.client.get("/api/v1/tokens", headers=mcp_headers).status_code, 403)
+        self.assertEqual(self.client.get(f"/api/v1/vaults/{new_id}/files", headers=mcp_headers).status_code, 403)
         mcp_response = self.rpc("tools/call", {"name": "list_vaults", "arguments": {}},
                                 {"token": mcp_created["token"]})
         self.assertEqual(mcp_response.status_code, 200, mcp_response.text)
