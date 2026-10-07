@@ -1,6 +1,8 @@
 """RAG: line-based chunks, FTS5 text search, embeddings (OpenAI-compatible), hybrid RRF.
 
-Only AI Available content ever reaches the chunk tables and the embedding endpoint.
+Only the current published note (``.md`` in AI Available, same version) is indexed.
+Attachments, other AI files, and encrypted sync blobs never become chunks. Rows that no
+longer match a published note are deleted before anything is sent to the embedding endpoint.
 Chunks and FTS rows are written synchronously on publish; embeddings are filled in by a
 background worker (`process_pending`) and may lag behind.
 """
@@ -20,7 +22,7 @@ from urllib.parse import urlsplit
 import httpcore
 import httpx
 
-from .ai_store import AiStore, is_text
+from .ai_store import AiStore
 from .db import Database
 from .errors import ApiError
 from .vaults import MAX_CHUNK_CHARS, VaultService
@@ -255,7 +257,8 @@ class RagService:
     # ---- indexing ----------------------------------------------------------------
     def index_file(self, vid: str, meta: dict, data: bytes) -> None:
         path = meta["path"]
-        if not is_text(path):
+        # Notes only. A published .txt/.csv/image must not stay in the index from an earlier build.
+        if not str(path).lower().endswith(".md"):
             self.remove_file(vid, path)
             return
         v = self.vaults.get(vid)
@@ -289,6 +292,30 @@ class RagService:
         with self.db.transaction():
             self._delete_chunks("vault_id=?", (vid,))
 
+    def prune_unpublished(self) -> int:
+        """Delete chunks that are not the current published note of the same version.
+
+        Search already hides these rows. Pruning them stops the embedding worker from
+        sending text that is no longer published.
+        """
+        stale = self.db.query(
+            """SELECT c.id FROM chunks c
+               LEFT JOIN ai_files f
+                 ON f.vault_id=c.vault_id AND f.path=c.path AND f.version=c.version AND f.kind='note'
+               WHERE f.path IS NULL"""
+        )
+        if not stale:
+            return 0
+        ids = [r["id"] for r in stale]
+        removed = 0
+        with self.db.transaction():
+            for i in range(0, len(ids), 500):
+                batch = ids[i:i + 500]
+                ph = ",".join("?" * len(batch))
+                self._delete_chunks(f"id IN ({ph})", tuple(batch))
+                removed += len(batch)
+        return removed
+
     def reindex_vault(self, vid: str) -> None:
         """Rebuild chunks (current chunk settings) and drop vectors for one vault."""
         self.remove_vault(vid)
@@ -305,8 +332,10 @@ class RagService:
     def _pending_sql(self) -> tuple[str, tuple]:
         cfg = self.embedding_cfg()
         key = self._key(cfg) if cfg else ""
-        return ("FROM chunks c JOIN vaults v ON v.id=c.vault_id WHERE v.rag_enabled=1 "
-                "AND (c.embedding IS NULL OR c.emb_key IS NOT ?)", (key,))
+        return ("FROM chunks c JOIN vaults v ON v.id=c.vault_id "
+                "JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path "
+                "AND f.version=c.version AND f.kind='note' "
+                "WHERE v.rag_enabled=1 AND (c.embedding IS NULL OR c.emb_key IS NOT ?)", (key,))
 
     def _pending_count(self) -> int:
         sql, p = self._pending_sql()
@@ -314,6 +343,7 @@ class RagService:
 
     def process_pending(self, max_batches: int = 1000) -> int:
         """Embed pending chunks. Returns chunks embedded, or -1 after a failure (retry later)."""
+        self.prune_unpublished()
         cfg = self.embedding_cfg()
         if not cfg:
             return 0
@@ -383,7 +413,8 @@ class RagService:
         rows = self.db.query(
             f"""SELECT c.id, c.vault_id, c.path, c.version, c.start_line, c.end_line, c.text, bm25(chunks_fts) s
                 FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.rowid
-                JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path AND f.version=c.version
+                JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path
+                    AND f.version=c.version AND f.kind='note'
                 WHERE chunks_fts MATCH ? AND c.vault_id IN ({ph}) ORDER BY s LIMIT ?""",
             (match, *vids, n))
         return [dict(r, score=-r["s"]) for r in rows]
@@ -399,7 +430,8 @@ class RagService:
         while True:
             rows = self.db.query(
                 f"""SELECT c.id, c.embedding FROM chunks c
-                    JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path AND f.version=c.version
+                    JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path
+                        AND f.version=c.version AND f.kind='note'
                     WHERE c.vault_id IN ({ph}) AND c.emb_key=? AND c.embedding IS NOT NULL AND c.id > ?
                     ORDER BY c.id LIMIT ?""", (*vids, key, last, SCAN_BATCH))
             if not rows:
@@ -427,8 +459,11 @@ class RagService:
         best = sorted(top, reverse=True)
         ids = [-i for _, i in best]
         details = {r["id"]: r for r in self.db.query(
-            f"""SELECT id, vault_id, path, version, start_line, end_line, text FROM chunks
-                WHERE id IN ({",".join("?" * len(ids))})""", ids)}
+            f"""SELECT c.id, c.vault_id, c.path, c.version, c.start_line, c.end_line, c.text
+                FROM chunks c
+                JOIN ai_files f ON f.vault_id=c.vault_id AND f.path=c.path
+                    AND f.version=c.version AND f.kind='note'
+                WHERE c.id IN ({",".join("?" * len(ids))})""", ids)}
         return [dict(details[-i], score=s) for s, i in best if -i in details]
 
     def search(self, query: str, vault_ids: list[str], mode: str = "hybrid", limit: int = 10) -> tuple[list[dict], str | None]:

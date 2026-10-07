@@ -23,8 +23,10 @@ directories and the `OBSI_*` variables. They are kept so that existing servers u
 
 - Synced files arrive **encrypted** on the device with rclone crypt. The server never sees the
   encryption password, file names or contents.
-- Notes a user allows for AI are published **in plain text**: the server indexes them and hands them
-  to MCP clients. AI access is off by default in the plugin.
+- Notes a user allows for AI are published **in plain text**: the server indexes only the current
+  version of a published note (`.md`) and hands it to MCP clients. Attachments, other AI Available
+  files, and the encrypted sync store are not indexed. Unpublishing deletes the chunks before that
+  text is sent for embeddings. AI access is off by default in the plugin.
 - MCP clients never write to a vault directly. A suggested edit is queued, and the user's Obsidian
   client applies it only if the AI rules allow it and the note has not changed.
 
@@ -306,8 +308,7 @@ follow redirects and ignores `HTTP_PROXY`. For a local Ollama (`http://localhost
 server with `OBSI_EMBEDDING_ALLOW_PRIVATE=1`. Changing `model` or `base-url` resets the vectors and
 the index is rebuilt in the background (a running server picks up CLI changes within ~10 seconds).
 
-Only texts from AI Available vaults with RAG enabled are sent to the embedding endpoint. Without
-configured embeddings (or with RAG disabled for a vault) `search` works as full-text search and says
+Only text of the current published notes (`.md`) from vaults with RAG enabled is sent to the embedding endpoint. A chunk that is no longer that note is deleted and not sent. Without configured embeddings (or with RAG disabled for a vault) `search` works as full-text search and says
 so in the `note` field.
 
 ## Connecting MCP clients

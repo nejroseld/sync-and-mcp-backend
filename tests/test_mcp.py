@@ -189,6 +189,18 @@ class SearchTests(ServerCase):
         self.ctx.db.execute("DELETE FROM ai_files WHERE path='x.md'")
         self.assertEqual(self.data(self.call("search", {"query": "orphanword", "mode": "text"})), [])
 
+    def test_index_keeps_only_current_published_notes(self):
+        self.publish("secret.md", "diaryword")
+        self.publish("notes.txt", "textword")
+        self.publish("sheet.csv", "csvword")
+        self.publish("img/a.png", b"\x89PNG")
+        paths = [r["path"] for r in self.ctx.db.query("SELECT DISTINCT path FROM chunks")]
+        self.assertEqual(paths, ["secret.md"])
+        self.assertEqual([r["path"] for r in self.data(self.call("search", {"query": "diaryword", "mode": "text"}))],
+                         ["secret.md"])
+        self.assertEqual(self.data(self.call("search", {"query": "textword", "mode": "text"})), [])
+        self.assertEqual(self.data(self.call("search", {"query": "csvword", "mode": "text"})), [])
+
 
 class RagTests(ServerCase):
     def configure(self, model="m1", base="https://emb.example/v1"):
@@ -308,6 +320,19 @@ class RagTests(ServerCase):
         before = self.ctx.db.one("SELECT COUNT(*) c FROM chunks")["c"]
         self.client.patch(f"/api/v1/admin/vaults/{self.vid}", headers=self.h(self.admin), json={"rag": {"chunk_chars": 100, "chunk_overlap": 0}})
         self.assertGreater(self.ctx.db.one("SELECT COUNT(*) c FROM chunks")["c"], before)
+
+    def test_unpublished_note_is_not_embedded(self):
+        self.publish("secret.md", "diaryword")
+        self.publish("notes.txt", "textword")
+        self.configure()
+        self.ctx.db.execute("DELETE FROM ai_files WHERE path='secret.md'")
+        self.embedder.calls.clear()
+        self.assertEqual(self.ctx.rag.process_pending(), 0)
+        self.assertEqual(self.ctx.db.one("SELECT COUNT(*) c FROM chunks")["c"], 0)
+        self.assertEqual(self.ctx.db.one("SELECT COUNT(*) c FROM chunks_fts")["c"], 0)
+        sent = [t for _, texts in self.embedder.calls for t in texts]
+        self.assertFalse(any("diaryword" in t for t in sent))
+        self.assertEqual(self.data(self.call("search", {"query": "diaryword", "mode": "semantic"})), [])
 
     def test_delete_removes_embeddings(self):
         self.seed()
