@@ -12,7 +12,7 @@ class ProtocolTests(ServerCase):
             self.assertIn("tools", res["capabilities"])
         res = self.rpc("initialize", {"protocolVersion": "1999-01-01"}).json()["result"]
         self.assertEqual(res["protocolVersion"], "2025-06-18")
-        self.assertEqual(res["serverInfo"]["name"], "obsi-mcp")
+        self.assertEqual(res["serverInfo"]["name"], "sync-and-mcp")
 
     def test_notification_202_and_get_405(self):
         r = self.client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"}, headers=self.h(self.mcp_tok))

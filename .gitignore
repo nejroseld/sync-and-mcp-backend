@@ -1,10 +1,13 @@
 .venv/
 data/
 obsi-data/
+work/
 __pycache__/
 *.egg-info/
 *.py[cod]
+.pytest_cache/
 .env
 .env.*
 TOKENS.txt
 *.key
+.DS_Store

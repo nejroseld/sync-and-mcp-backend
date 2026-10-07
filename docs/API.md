@@ -1,4 +1,4 @@
-# obsi-mcp — HTTP API v1 (контракт клиент ↔ сервер)
+# Sync and MCP — HTTP API v1 (контракт клиент ↔ сервер)
 
 Базовый префикс: `/api/v1`. Авторизация: `Authorization: Bearer <token>`.
 Ошибки: JSON `{"error": {"code": "<snake_case>", "message": "..."}}` и HTTP-статус

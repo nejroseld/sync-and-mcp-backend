@@ -3,13 +3,21 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "obsi-server"
+name = "sync-and-mcp-backend"
 version = "0.1.0"
-description = "obsi-mcp server: E2EE sync storage, AI Available store, MCP endpoint and RAG"
+description = "Sync and MCP backend: E2EE sync storage for the Sync and MCP Obsidian plugin, AI Available store, MCP endpoint and RAG"
+readme = "README.md"
+license = {text = "GPL-3.0-only"}
+authors = [{name = "nejroseld"}]
 requires-python = ">=3.11"
 # Production installs use the hash-pinned requirements*.lock files (see install-vps.sh).
 # httpx is held to one minor release: rag.py replaces its connection pool.
 dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.28,<0.29", "httpcore>=1.0.5,<2"]
+
+[project.urls]
+Homepage = "https://github.com/nejroseld/sync-and-mcp-backend"
+Issues = "https://github.com/nejroseld/sync-and-mcp-backend/issues"
+Plugin = "https://github.com/nejroseld/sync-and-mcp"
 
 [project.optional-dependencies]
 fast = ["numpy>=1.26,<3"]

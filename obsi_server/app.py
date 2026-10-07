@@ -538,7 +538,7 @@ def create_app(config: Config | None = None, embed_fn: EmbedFn = http_embed) -> 
         ctx.db.close()
 
     docs = {} if config.api_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
-    app = FastAPI(title="obsi-mcp", version=__version__, lifespan=lifespan, **docs)
+    app = FastAPI(title="Sync and MCP backend", version=__version__, lifespan=lifespan, **docs)
     app.state.ctx = ctx
     app.state.upload_slots = asyncio.Semaphore(config.max_concurrent_uploads)
     app.add_middleware(NoStoreMiddleware)

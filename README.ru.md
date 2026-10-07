@@ -1,8 +1,32 @@
-# obsi-mcp server
+# Sync and MCP — сервер
 
-Сервер для плагина Obsidian: хранит зашифрованные blob'ы vault'ов (sync), принимает опубликованный
-plaintext «AI Available», отдаёт его по MCP (streamable HTTP) и строит поиск (FTS5 + эмбеддинги).
+[English](README.md) | **Русский**
+
+Сервер для плагина Obsidian [Sync and MCP](https://github.com/nejroseld/sync-and-mcp): хранит
+зашифрованные blob'ы vault'ов (sync), принимает опубликованный plaintext «AI Available», отдаёт
+его по MCP (streamable HTTP) и строит поиск (FTS5 + эмбеддинги).
 Контракт описан в `docs/API.md`, архитектура в `docs/ARCHITECTURE.md`.
+
+Код сервера:
+
+```bash
+git clone https://github.com/nejroseld/sync-and-mcp-backend.git
+cd sync-and-mcp-backend
+```
+
+Технические имена остались от рабочего названия проекта obsi-mcp: Python-пакет `obsi_server`,
+команда `obsi-server`, сервис `obsi-mcp.service`, каталоги `/opt/obsi-mcp` и `/var/lib/obsi-mcp`,
+переменные `OBSI_*`. Они не меняются, чтобы обновление уже установленных серверов проходило без
+миграции.
+
+## Что видит сервер
+
+- Синхронизируемые файлы шифруются на устройстве через rclone crypt и приходят **зашифрованными**.
+  Пароль шифрования, имена и содержимое файлов сервер не знает.
+- Заметки, открытые пользователем для ИИ, публикуются **открытым текстом**: сервер индексирует их
+  и отдаёт MCP-клиентам. В плагине доступ ИИ по умолчанию выключен.
+- MCP-клиенты не пишут в vault напрямую. Предложенная правка ставится в очередь, и Obsidian
+  пользователя применяет её, только если это разрешают правила ИИ и заметка не изменилась.
 
 ## Несколько пользователей
 
@@ -20,10 +44,10 @@ obsi-server --data-dir ./data admin list-users
 пересылайте их одним сообщением:
 
 ```
-Приглашение в Obsi Sync для alice
+Приглашение в Sync and MCP для alice
 Сервер: https://203-0-113-10.sslip.io
 Код: inv_...
-В Obsidian: Obsi Sync → «У меня есть приглашение», вставьте это сообщение целиком.
+В Obsidian: Sync and MCP → «У меня есть приглашение», вставьте это сообщение целиком.
 ```
 
 Готовое сообщение печатают `manage-vps.sh` (пункт меню «Пользователи и приглашения»),
@@ -81,7 +105,7 @@ implicit owner access, не могут создавать vault'ы и управ
    (S3 не настраивается). В конце скрипт проверяет `/api/v1/health` и показывает
    первое приглашение в виде готового сообщения с адресом сервера и кодом; admin-токен
    выводится на экран только после отдельного подтверждения.
-   Его можно переслать или вставить в Obsi Sync самому: «У меня есть приглашение».
+   Его можно переслать или вставить в Sync and MCP самому: «У меня есть приглашение».
 
 Последующие запуски открывают меню. По Enter выполняется пункт по умолчанию (обновление
 сервера). В меню также есть данные для подключения, состояние и логи, домен и HTTPS,
@@ -157,14 +181,14 @@ sudo ./install-vps.sh
 
 Сценарий: сервер и Obsidian на одном компьютере. Нужен Python 3.11+ (`python3 --version`).
 
-**1. Забрать код** (из Git-репозитория сервера или скопировать его каталог, например с ВМ):
+**1. Забрать код:**
 
 ```bash
-scp -r ai@192.168.122.187:/path/to/obsi-server ~/obsi-server
-cd ~/obsi-server
+git clone https://github.com/nejroseld/sync-and-mcp-backend.git ~/sync-and-mcp-backend
+cd ~/sync-and-mcp-backend
 ```
 
-Если скопировать вместе с `data/`, сохранятся уже созданные vault'ы и токены
+Если переносите уже работающий сервер с другой машины, скопируйте его каталог вместе с `data/`: так сохранятся уже созданные vault'ы и токены
 (см. `data/TOKENS.txt`); тогда шаг 4 можно пропустить.
 
 **2. Установить зависимости в venv:**
@@ -198,11 +222,12 @@ obsi-server --data-dir ./data admin create-invite --name alice
 
 Токены показываются один раз — сохраните их.
 
-**5. Плагин в Obsidian:** в отдельном репозитории плагина выполните `npm install && npm run build`,
-затем скопируйте `main.js`, `manifest.json`, `styles.css` в `<vault>/.obsidian/plugins/obsi-sync/`,
-включить в Settings → Community plugins. В мастере плагина: Server URL
-`http://127.0.0.1:8766`, «Создать аккаунт», полученный код приглашения, логин и пароль;
-затем создать vault и ввести отдельный пароль шифрования.
+**5. Плагин в Obsidian:** установите [Sync and MCP](https://github.com/nejroseld/sync-and-mcp)
+через BRAT (`nejroseld/sync-and-mcp`) или скопируйте `main.js`, `manifest.json`, `styles.css`
+из релиза плагина в `<vault>/.obsidian/plugins/sync-and-mcp/` и включите его в Settings → Community plugins. В мастере плагина выберите
+«У меня есть приглашение» и вставьте адрес `http://127.0.0.1:8766` вместе с кодом приглашения
+(или всё сообщение целиком), затем задайте логин и пароль, создайте vault и введите отдельный
+пароль шифрования.
 
 **6. MCP в Claude Code:**
 
@@ -327,7 +352,7 @@ curl -s http://127.0.0.1:18765/api/v1/health
 # {"ok":true,"version":"0.1.0","features":{"ai":true,"mcp":true,"rag":true}}  (с localhost)
 curl -s -X POST http://127.0.0.1:18765/mcp -H "Authorization: Bearer $MCP" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
-# {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"obsi-mcp",...}}}
+# {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"sync-and-mcp",...}}}
 curl -s -X POST http://127.0.0.1:18765/mcp -H "Authorization: Bearer $MCP" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 # list_vaults, list_notes, search, read_note, write_note, get_change_status

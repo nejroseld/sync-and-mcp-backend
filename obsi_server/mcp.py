@@ -106,7 +106,7 @@ class McpServer:
                 want = params.get("protocolVersion")
                 ver = want if want in SUPPORTED_VERSIONS else SUPPORTED_VERSIONS[0]
                 return self._ok(mid, {"protocolVersion": ver, "capabilities": {"tools": {"listChanged": False}},
-                                      "serverInfo": {"name": "obsi-mcp", "version": __version__},
+                                      "serverInfo": {"name": "sync-and-mcp", "version": __version__},
                                       "instructions": INSTRUCTIONS})
             if method == "ping":
                 return self._ok(mid, {})

@@ -636,7 +636,7 @@ show_credentials() {
   printf '\n'
 }
 
-# A ready-to-forward invitation: Obsi Sync finds the server URL and the inv_ code in any pasted text.
+# A ready-to-forward invitation: Sync and MCP finds the server URL and the inv_ code in any pasted text.
 invite_message() { # URL CODE [NAME]
   local title
   if [[ -n ${3:-} ]]; then title=$(m invite_title_for "$3"); else title=$(m invite_title); fi

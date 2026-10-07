@@ -43,10 +43,10 @@ if [ "$(obsi admin list-tokens)" = "[]" ]; then
   ADMIN=$(obsi admin create-token --kind admin --name admin | token_of token)
   INVITE=$(obsi admin create-invite --name first-user | token_of code)
   URL="http://127.0.0.1:$PORT"
-  MESSAGE="Obsi Sync invitation
+  MESSAGE="Sync and MCP invitation
 Server: $URL
 Code: $INVITE
-In Obsidian: Obsi Sync → \"I have an invitation\", paste this whole message."
+In Obsidian: Sync and MCP → \"I have an invitation\", paste this whole message."
   cat > "$DATA/TOKENS.txt" <<EOF
 obsi-mcp local server
 URL:     $URL
@@ -57,7 +57,7 @@ $ADMIN
 First user invitation (one use):
 $INVITE
 
-Invitation message (forward it to the first user, or paste it into Obsi Sync yourself):
+Invitation message (forward it to the first user, or paste it into Sync and MCP yourself):
 $MESSAGE
 
 The user then picks a username and an account password, creates their own server vault

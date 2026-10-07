@@ -151,10 +151,10 @@ elif [[ $(obsi admin list-tokens | json_count) == 0 ]]; then
   echo 'Creating admin access and the first user invitation'
   ADMIN=$(obsi admin create-token --kind admin --name admin | json_field token)
   INVITE=$(obsi admin create-invite --name first-user | json_field code)
-  MESSAGE="Obsi Sync invitation
+  MESSAGE="Sync and MCP invitation
 Server: <your server address>
 Code: $INVITE
-In Obsidian: Obsi Sync → \"I have an invitation\", paste this whole message."
+In Obsidian: Sync and MCP → \"I have an invitation\", paste this whole message."
   umask 077
   cat > "$TOKENS_FILE" <<EOF
 Admin token:
