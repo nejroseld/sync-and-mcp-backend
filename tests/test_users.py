@@ -82,7 +82,7 @@ class UserAccountTests(ServerCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.client.get("/api/v1/vaults", headers=self.h(self.admin)).status_code, 200)
 
-    def test_device_tokens_match_the_account_and_mcp_stays_scoped(self):
+    def test_device_tokens_with_grants_stay_scoped_and_account_devices_match_the_login(self):
         invitation = self.client.post("/api/v1/admin/invites", headers=self.h(self.admin),
                                       json={"name": "Alice"}).json()
         alice = self.register(invitation["code"]).json()
@@ -103,41 +103,89 @@ class UserAccountTests(ServerCase):
         self.assertEqual(self.client.post("/api/v1/tokens", headers=ah, json={
             "name": "admin escalation", "kind": "admin", "grants": {},
         }).status_code, 422)
+        # A device token issued with grants stays limited to them.
         issued = self.client.post("/api/v1/tokens", headers=ah, json={
             "name": "limited", "kind": "device", "grants": {own: ["read"]},
         })
         self.assertEqual(issued.status_code, 200, issued.text)
         delegated = issued.json()
+        self.assertFalse(delegated["account"])
         dh = {"Authorization": "Bearer " + delegated["token"]}
         me = self.client.get("/api/v1/me", headers=dh).json()
         self.assertFalse(me["account_token"])
+        self.assertFalse(me["account"])
         self.assertEqual(me["user"]["id"], alice["user"]["id"])
-        created = self.client.post("/api/v1/vaults", headers=dh, json={"name": "Phone folder"})
+        self.assertEqual(self.client.get(f"/api/v1/vaults/{own}/files", headers=dh).status_code, 200)
+        self.assertEqual(self.client.put(f"/api/v1/vaults/{own}/files/note", headers=dh,
+                                        content=b"blocked").status_code, 403)
+        self.assertEqual(self.client.post("/api/v1/vaults", headers=dh, json={"name": "Nope"}).status_code, 403)
+        self.assertEqual(self.client.get("/api/v1/tokens", headers=dh).status_code, 403)
+        self.assertEqual(self.client.post("/api/v1/tokens", headers=dh, json={
+            "name": "escalate", "kind": "device"}).status_code, 403)
+        self.assertEqual(self.client.post(f"/api/v1/tokens/{delegated['id']}/revoke", headers=dh).status_code, 403)
+        self.assertEqual([v["id"] for v in self.client.get("/api/v1/vaults", headers=dh).json()["vaults"]], [own])
+        # Emptying the grants of a limited token does not turn it into an account token.
+        self.assertEqual(self.client.patch(f"/api/v1/tokens/{delegated['id']}", headers=ah,
+                                           json={"grants": {}}).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/v1/vaults/{own}/files", headers=dh).status_code, 403)
+        self.assertEqual(self.client.get("/api/v1/tokens", headers=dh).status_code, 403)
+        self.assertEqual(self.client.patch(f"/api/v1/tokens/{delegated['id']}", headers=ah,
+                                           json={"grants": {own: ["read"]}}).status_code, 200)
+
+        # "Add device": a device token without grants has the login's rights and can add devices.
+        self.assertEqual(self.client.post("/api/v1/tokens", headers=ah, json={
+            "name": "mixed", "kind": "device", "account": True, "grants": {own: ["read"]},
+        }).status_code, 422)
+        self.assertEqual(self.client.post("/api/v1/tokens", headers=ah, json={
+            "name": "mcp account", "kind": "mcp", "account": True,
+        }).status_code, 422)
+        phone_issued = self.client.post("/api/v1/tokens", headers=ah, json={"name": "Phone", "kind": "device"})
+        self.assertEqual(phone_issued.status_code, 200, phone_issued.text)
+        phone = phone_issued.json()
+        self.assertTrue(phone["account"])
+        self.assertFalse(phone["is_session"])
+        ph = {"Authorization": "Bearer " + phone["token"]}
+        self.assertTrue(self.client.get("/api/v1/me", headers=ph).json()["account"])
+        created = self.client.post("/api/v1/vaults", headers=ph, json={"name": "Phone folder"})
         self.assertEqual(created.status_code, 200, created.text)
         new_id = created.json()["id"]
         self.assertEqual(created.json()["owner_user_id"], alice["user"]["id"])
-        self.assertEqual(self.client.put(f"/api/v1/vaults/{new_id}/files/note", headers=dh,
+        self.assertEqual(self.client.put(f"/api/v1/vaults/{new_id}/files/note", headers=ph,
                                         content=b"from the phone").status_code, 200)
-        self.assertEqual(self.client.get(f"/api/v1/vaults/{own}/files", headers=dh).status_code, 200)
-        self.assertEqual(self.client.put(f"/api/v1/vaults/{own}/files/note", headers=dh,
+        self.assertEqual(self.client.put(f"/api/v1/vaults/{own}/files/note", headers=ph,
                                         content=b"owner write").status_code, 200)
-        self.assertEqual(self.client.get(f"/api/v1/vaults/{bob_vault}/files", headers=dh).status_code, 403)
+        self.assertEqual(self.client.get(f"/api/v1/vaults/{bob_vault}/files", headers=ph).status_code, 403)
         self.assertEqual(self.client.post("/api/v1/vaults", headers=self.h(self.dev),
                                          json={"name": "no account"}).status_code, 403)
         self.assertEqual(self.client.get("/api/v1/tokens", headers=self.h(self.dev)).status_code, 403)
-        self.assertEqual([v["id"] for v in self.client.get("/api/v1/vaults", headers=dh).json()["vaults"]],
+        self.assertEqual([v["id"] for v in self.client.get("/api/v1/vaults", headers=ph).json()["vaults"]],
                          [own, new_id])
-        listed_by_device = self.client.get("/api/v1/tokens", headers=dh)
+        self.assertEqual(self.client.patch(f"/api/v1/tokens/{phone['id']}", headers=ah,
+                                           json={"grants": {own: ["read"]}}).status_code, 422)
+        listed_by_device = self.client.get("/api/v1/tokens", headers=ph)
         self.assertEqual(listed_by_device.status_code, 200, listed_by_device.text)
-        self.assertIn(delegated["id"], [t["id"] for t in listed_by_device.json()["tokens"]])
-        issued_by_device = self.client.post("/api/v1/tokens", headers=dh, json={
+        self.assertIn(phone["id"], [t["id"] for t in listed_by_device.json()["tokens"]])
+        issued_by_device = self.client.post("/api/v1/tokens", headers=ph, json={
             "name": "tablet", "kind": "device", "grants": {},
         })
         self.assertEqual(issued_by_device.status_code, 200, issued_by_device.text)
-        self.assertFalse(issued_by_device.json()["is_session"])
-        tablet = {"Authorization": "Bearer " + issued_by_device.json()["token"]}
+        tablet_tok = issued_by_device.json()
+        self.assertFalse(tablet_tok["is_session"])
+        self.assertTrue(tablet_tok["account"])
+        self.assertEqual(tablet_tok["parent_id"], phone["id"])
+        tablet = {"Authorization": "Bearer " + tablet_tok["token"]}
         self.assertEqual(self.client.get(f"/api/v1/vaults/{own}/files", headers=tablet).status_code, 200)
         self.assertEqual(self.client.get("/api/v1/tokens", headers=tablet).status_code, 200)
+        watch = self.client.post("/api/v1/tokens", headers=tablet, json={"name": "watch", "kind": "device"}).json()
+        wh = {"Authorization": "Bearer " + watch["token"]}
+
+        # Revoking the phone also revokes everything issued through it, at any depth.
+        revoked_phone = self.client.post(f"/api/v1/tokens/{phone['id']}/revoke", headers=ah)
+        self.assertEqual(revoked_phone.status_code, 200, revoked_phone.text)
+        self.assertCountEqual(revoked_phone.json()["revoked_descendants"], [tablet_tok["id"], watch["id"]])
+        for headers in (ph, tablet, wh):
+            self.assertEqual(self.client.get("/api/v1/vaults", headers=headers).status_code, 401)
+        self.assertEqual(self.client.get("/api/v1/vaults", headers=ah).status_code, 200)
         self.assertEqual(self.client.patch(f"/api/v1/tokens/{delegated['id']}", headers=bob_headers,
                                            json={"name": "stolen"}).status_code, 404)
         self.assertEqual(self.client.post(f"/api/v1/tokens/{delegated['id']}/revoke", headers=bob_headers).status_code, 404)
@@ -340,6 +388,28 @@ class UserAdminCliTests(unittest.TestCase):
             db = Database(path)
             sessions = {r["id"]: r["is_session"] for r in db.query("SELECT id,is_session FROM tokens")}
             self.assertEqual(sessions, {"tok_old": 1, "tok_mcp": 0})
+            db.close()
+
+    def test_upgrade_keeps_added_devices_as_account_tokens_and_scoped_tokens_limited(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            path = data_dir + "/obsi.db"
+            conn = self._old_db(path, MIGRATIONS[:7])
+            conn.execute("INSERT INTO users(id,username,password_hash,created_at) VALUES('u_old','alice','hash',1)")
+            for tid, name, kind, grants, session in (
+                    ("tok_login", "user:alice", "device", "{}", 1),
+                    ("tok_phone", "Phone", "device", "{}", 0),            # added device
+                    ("tok_scoped", "Backup", "device", '{"v":["read"]}', 0),
+                    ("tok_mcp", "Assistant", "mcp", "{}", 0)):
+                conn.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id,is_session) "
+                             "VALUES(?,?,?,?,?,1,'u_old',?)", (tid, name, kind, tid, grants, session))
+            conn.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at) "
+                         "VALUES('tok_legacy','legacy','device','h','{}',1)")
+            conn.commit()
+            conn.close()
+            db = Database(path)
+            account = {r["id"]: r["account"] for r in db.query("SELECT id,account FROM tokens")}
+            self.assertEqual(account, {"tok_login": 1, "tok_phone": 1, "tok_scoped": 0, "tok_mcp": 0,
+                                       "tok_legacy": 0})
             db.close()
 
     def test_admin_cli_create_invite_and_list_commands(self):

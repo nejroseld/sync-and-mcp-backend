@@ -39,6 +39,8 @@ class Token:
     user_id: str | None = None
     is_session: bool = False
     expires_at: int | None = None
+    account: bool = False  # account rights: owned vaults, vault creation, token management
+    parent_id: str | None = None  # the token that issued this one
 
     def can(self, vault_id: str, op: str) -> bool:
         return op in self.grants.get(vault_id, ())
@@ -54,6 +56,8 @@ class Token:
             "user_id": self.user_id,
             "is_session": self.is_session,
             "expires_at": self.expires_at,
+            "account": self.account,
+            "parent_id": self.parent_id,
         }
 
 
@@ -63,7 +67,8 @@ def hash_token(token: str) -> str:
 
 def _row(r) -> Token:
     return Token(r["id"], r["name"], r["kind"], json.loads(r["grants"]), r["created_at"],
-                 r["revoked_at"], r["last_used_at"], r["user_id"], bool(r["is_session"]), r["expires_at"])
+                 r["revoked_at"], r["last_used_at"], r["user_id"], bool(r["is_session"]), r["expires_at"],
+                 bool(r["account"]), r["parent_id"])
 
 
 class AuthService:
@@ -210,8 +215,8 @@ class AuthService:
         tid, ts = "tok_" + secrets.token_hex(6), now_ms()
         with self.db.transaction():
             self.db.execute(
-                "INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id,is_session,expires_at) "
-                "VALUES(?,?,?,?,?,?,?,1,?)",
+                "INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id,is_session,expires_at,account) "
+                "VALUES(?,?,?,?,?,?,?,1,?,1)",
                 (tid, SESSION_PREFIX + username, "device", hash_token(plain), "{}", ts, user_id,
                  ts + self.session_ttl_ms))
             live = self.db.query(
@@ -253,16 +258,25 @@ class AuthService:
         return Token(tid, name, kind, grants, ts), plain
 
     def create_user_token(self, user_id: str, name: str, kind: str,
-                          grants: dict[str, list[str]] | None = None) -> tuple[Token, str]:
+                          grants: dict[str, list[str]] | None = None, account: bool | None = None,
+                          parent_id: str | None = None) -> tuple[Token, str]:
+        """`account` defaults to True for a device token without grants (the "add device" flow)."""
         if kind not in ("device", "mcp"):
             raise ApiError(422, "invalid_kind", "user tokens must be kind=device or kind=mcp")
         self._check_user_token_name(name)
         clean = self.clean_grants(kind, grants)
+        if account is None:
+            account = kind == "device" and not clean
+        if account and kind != "device":
+            raise ApiError(422, "invalid_account", "only device tokens can have account rights")
+        if account and clean:
+            raise ApiError(422, "invalid_account", "an account token has access to all owned vaults; omit grants")
         plain = "obsi_" + secrets.token_urlsafe(32)
         tid, ts = "tok_" + secrets.token_hex(6), now_ms()
-        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id) VALUES(?,?,?,?,?,?,?)",
-                        (tid, name, kind, hash_token(plain), json.dumps(clean), ts, user_id))
-        return Token(tid, name, kind, clean, ts, user_id=user_id), plain
+        self.db.execute("INSERT INTO tokens(id,name,kind,token_hash,grants,created_at,user_id,account,parent_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (tid, name, kind, hash_token(plain), json.dumps(clean), ts, user_id, int(account), parent_id))
+        return Token(tid, name, kind, clean, ts, user_id=user_id, account=account, parent_id=parent_id), plain
 
     def list_user(self, user_id: str) -> list[Token]:
         return [_row(r) for r in self.db.query("SELECT * FROM tokens WHERE user_id=? ORDER BY created_at,id", (user_id,))]
@@ -273,13 +287,15 @@ class AuthService:
             raise ApiError(404, "not_found", "token not found")
         if name is not None:
             self._check_user_token_name(name)
+        if tok.account and grants:
+            raise ApiError(422, "invalid_account", "an account token has access to all owned vaults; omit grants")
         return self.update(token_id, name, grants)
 
-    def revoke_user(self, user_id: str, token_id: str) -> Token:
+    def revoke_user(self, user_id: str, token_id: str) -> tuple[Token, list[str]]:
         tok = self.get(token_id)
         if not tok or tok.user_id != user_id:
             raise ApiError(404, "not_found", "token not found")
-        return self.revoke(token_id)
+        return self.revoke_tree(token_id)
 
     def authenticate(self, plain: str | None) -> Token | None:
         """Returns the token if it exists, is not revoked and has not expired; touches last_used_at."""
@@ -325,13 +341,32 @@ class AuthService:
         return self.update(token_id, grants=grants)
 
     def revoke(self, token_id: str) -> Token:
-        tok = self.get(token_id)
-        if not tok:
-            raise ApiError(404, "not_found", "token not found")
-        if tok.revoked_at is None:
-            tok.revoked_at = now_ms()
-            self.db.execute("UPDATE tokens SET revoked_at=? WHERE id=?", (tok.revoked_at, tok.id))
-        return tok
+        return self.revoke_tree(token_id)[0]
+
+    def revoke_tree(self, token_id: str) -> tuple[Token, list[str]]:
+        """Revoke a token and every token issued through it, directly or not.
+
+        Returns the token and the ids of descendants revoked by this call. A leaked token
+        could have issued new ones; revoking it must not leave those alive. Session
+        eviction (login cap) and expiry do not cascade: they are not a compromise signal.
+        """
+        ts = now_ms()
+        with self.db.transaction():
+            tok = self.get(token_id)
+            if not tok:
+                raise ApiError(404, "not_found", "token not found")
+            if tok.revoked_at is None:
+                tok.revoked_at = ts
+                self.db.execute("UPDATE tokens SET revoked_at=? WHERE id=?", (ts, tok.id))
+            rows = self.db.query(
+                "WITH RECURSIVE tree(id) AS (SELECT id FROM tokens WHERE parent_id=? "
+                "UNION SELECT t.id FROM tokens t JOIN tree ON t.parent_id=tree.id) "
+                "SELECT tokens.id FROM tokens JOIN tree ON tokens.id=tree.id WHERE tokens.revoked_at IS NULL "
+                "ORDER BY tokens.created_at, tokens.id", (tok.id,))
+            ids = [r["id"] for r in rows]
+            for tid in ids:
+                self.db.execute("UPDATE tokens SET revoked_at=? WHERE id=?", (ts, tid))
+        return tok, ids
 
     def drop_vault(self, vault_id: str) -> None:
         for tok in self.list():

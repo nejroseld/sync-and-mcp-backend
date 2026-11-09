@@ -58,9 +58,11 @@ password, creates a server vault and sets a separate encryption password. Next t
 "Sign in to my account". A user sees only their own vaults and the ones the administrator explicitly
 shared. In the plugin, the administrator can create invitations and list accounts on the "Server" tab.
 
-After signing in, an account session can call `/api/v1/tokens` to issue device or MCP tokens with
-explicit grants on the user's own vaults. Delegated tokens get no implicit owner access, cannot
-create vaults and cannot manage tokens. See [docs/API.md](docs/API.md) for the full contract.
+After signing in, an account session can call `/api/v1/tokens` to issue tokens. A device token
+issued without grants is an added device: it has the login's rights and can add further devices.
+Device and MCP tokens issued with explicit grants on the user's own vaults are limited to them,
+cannot create vaults and cannot manage tokens. Revoking a token also revokes every token issued
+through it. See [docs/API.md](docs/API.md) for the full contract.
 
 On a fresh install `local.sh` and `install-vps.sh` create an admin token and the first invitation.
 On an existing server the data and old tokens are kept; create invitations for new users with the

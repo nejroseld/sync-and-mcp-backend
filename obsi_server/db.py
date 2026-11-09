@@ -90,6 +90,16 @@ MIGRATIONS: list[str] = [
     UPDATE invites SET expires_at = CAST(strftime('%s','now') AS INTEGER) * 1000 + 7 * 86400000
         WHERE used_at IS NULL;
     """,
+    # Account rights are an explicit flag, not "any device token with a user_id". Sessions and
+    # device tokens issued without grants (the "add device" flow) keep account rights; tokens
+    # issued with grants stay limited to them. parent_id lets a revoke reach issued tokens.
+    """
+    ALTER TABLE tokens ADD COLUMN account INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE tokens ADD COLUMN parent_id TEXT;
+    UPDATE tokens SET account=1 WHERE kind='device' AND user_id IS NOT NULL
+        AND (is_session=1 OR grants='{}');
+    CREATE INDEX tokens_parent ON tokens(parent_id);
+    """,
 ]
 
 

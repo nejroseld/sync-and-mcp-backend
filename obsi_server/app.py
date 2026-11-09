@@ -103,8 +103,11 @@ def auth(*kinds: str):
 
 
 def account_device(tok: Token) -> bool:
-    """Password login and a device token issued for that account. MCP stays on its grants."""
-    return tok.kind == "device" and tok.user_id is not None
+    """Password login and device tokens issued with account rights ("add device").
+
+    Device tokens issued with grants and MCP tokens stay limited to their grants.
+    """
+    return tok.kind == "device" and tok.user_id is not None and (tok.is_session or tok.account)
 
 
 def require_account_device(tok: Token) -> None:
@@ -196,6 +199,8 @@ class TokenIn(BaseModel):
     name: str
     kind: Literal["device", "mcp", "admin"]
     grants: dict[str, list[str]] = {}
+    # User tokens only. Omitted: account rights for a device token without grants.
+    account: bool | None = None
 
 
 class TokenPatch(BaseModel):
@@ -238,7 +243,7 @@ def core_router() -> APIRouter:
     def me(request: Request, tok: Token = Depends(auth())):
         user_row = get_ctx(request).db.one("SELECT * FROM users WHERE id=?", (tok.user_id,)) if tok.user_id else None
         return {"token_id": tok.id, "name": tok.name, "kind": tok.kind, "grants": tok.grants,
-                "account_token": tok.is_session,
+                "account_token": tok.is_session, "account": account_device(tok),
                 **({"user": AuthService.public_user(user_row)} if user_row else {})}
 
     @r.get("/vaults")
@@ -272,7 +277,8 @@ def core_router() -> APIRouter:
             vault = ctx.vaults.get(vid)
             if not vault or vault["owner_user_id"] != tok.user_id:
                 raise ApiError(422, "unknown_vault", f"vault {vid} is not owned by this account")
-        created, plain = ctx.auth.create_user_token(tok.user_id, body.name, body.kind, body.grants)
+        created, plain = ctx.auth.create_user_token(tok.user_id, body.name, body.kind, body.grants,
+                                                    account=body.account, parent_id=tok.id)
         return {**created.public(), "token": plain}
 
     @r.patch("/tokens/{tid}")
@@ -288,7 +294,8 @@ def core_router() -> APIRouter:
     @r.post("/tokens/{tid}/revoke")
     def revoke_user_token(tid: str, request: Request, tok: Token = Depends(auth("device"))):
         require_account_device(tok)
-        return get_ctx(request).auth.revoke_user(tok.user_id, tid).public()
+        revoked, descendants = get_ctx(request).auth.revoke_user(tok.user_id, tid)
+        return {**revoked.public(), "revoked_descendants": descendants}
 
     @r.post("/vaults")
     def create_user_vault(body: VaultIn, request: Request, tok: Token = Depends(auth("device"))):
@@ -388,7 +395,8 @@ def admin_router() -> APIRouter:
 
     @r.post("/tokens/{tid}/revoke")
     def revoke(tid: str, request: Request):
-        return get_ctx(request).auth.revoke(tid).public()
+        revoked, descendants = get_ctx(request).auth.revoke_tree(tid)
+        return {**revoked.public(), "revoked_descendants": descendants}
 
     def _settings(ctx: Context) -> dict:
         e = ctx.db.get_setting("embedding", {}) or {}
